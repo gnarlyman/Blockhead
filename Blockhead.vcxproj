@@ -102,7 +102,7 @@
     <ClCompile>
       <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)\..;$(SolutionDir)\..\obse\obse;$(SolutionDir)\..\obse\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;OBLIVION_VERSION=0x010201A0;OBLIVION;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <PrecompiledHeader>
       </PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
@@ -169,7 +169,9 @@
     <ClCompile Include="BlockheadInternals.cpp" />
     <ClCompile Include="BodyOverride.cpp" />
     <ClCompile Include="Commands.cpp" />
+    <ClCompile Include="EngineRaceFix.cpp" />
     <ClCompile Include="EquipmentOverride.cpp" />
+    <ClCompile Include="FastPath.cpp" />
     <ClCompile Include="HeadOverride.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Sundries.cpp" />
@@ -208,7 +210,9 @@
     <ClInclude Include="BlockheadInternals.h" />
     <ClInclude Include="BodyOverride.h" />
     <ClInclude Include="Commands.h" />
+    <ClInclude Include="EngineRaceFix.h" />
     <ClInclude Include="EquipmentOverride.h" />
+    <ClInclude Include="FastPath.h" />
     <ClInclude Include="HeadOverride.h" />
     <ClInclude Include="Sundries.h" />
     <ClInclude Include="VersionInfo.h" />

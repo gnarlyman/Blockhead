@@ -1,8 +1,99 @@
 #include "HeadOverride.h"
+#include "FastPath.h"
+
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
 
 ScriptedActorAssetOverrider<ScriptedTextureOverrideData>		ScriptHeadOverrideAgent::TextureOverrides;
 ScriptedActorAssetOverrider<ScriptedModelOverrideData>			ScriptHeadOverrideAgent::MeshOverrides;
 FaceGenAgeTextureOverrider										FaceGenAgeTextureOverrider::Instance;
+
+// =====================================================================================
+// [RBRN] Fix 2: per-FGP allocator-ownership tracking.
+//
+// Blockhead writes its own FormHeap-allocated TESModel/TESTexture/TESHair pointers into
+// FaceGenHeadParameters slots. The engine's dtor (DoFaceGenHeadParametersDtorHook) walks
+// every slot and unconditionally FormHeap_Frees the pointer found there. Two failure modes:
+//   (a) wrong-allocator free: the engine has re-populated a slot with an engine-owned
+//       pointer (different allocator) since Blockhead's last swap.
+//   (b) double-free: the engine queues the same FGP for two dtor calls (BSTask + main).
+//
+// Tracking only the pointers Blockhead installed (and consuming them on free) closes both
+// failure modes simultaneously: untracked pointers are left alone (engine frees its own),
+// and a pointer freed once is removed from the set so subsequent dtor calls treat it as
+// engine-owned and skip it.
+// =====================================================================================
+static std::mutex                                                                g_OwnedPointersLock;
+static std::unordered_map<FaceGenHeadParameters*, std::unordered_set<void*>>     g_OwnedPointers;
+
+// [RBRN] Fix 11: atomic count of tracked pointers across all FGPs. Hot path can check
+// this with a single relaxed atomic load (no lock acquisition) and skip the dtor's lock
+// + iteration when nothing was ever allocated. With Fix 8's in-place mutation, this is
+// the common case for nearly all actors.
+static std::atomic<int>                                                          g_OwnedPointersCount{0};
+
+static void TrackOwnedPointer(FaceGenHeadParameters* fgp, void* ptr)
+{
+	if (!fgp || !ptr) return;
+	std::lock_guard<std::mutex> g(g_OwnedPointersLock);
+	if (g_OwnedPointers[fgp].insert(ptr).second) {
+		g_OwnedPointersCount.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+static bool ConsumeOwnedPointer(FaceGenHeadParameters* fgp, void* ptr)
+{
+	if (!fgp || !ptr) return false;
+	std::lock_guard<std::mutex> g(g_OwnedPointersLock);
+	auto fgpIt = g_OwnedPointers.find(fgp);
+	if (fgpIt == g_OwnedPointers.end()) return false;
+	bool erased = fgpIt->second.erase(ptr) > 0;
+	if (erased) g_OwnedPointersCount.fetch_sub(1, std::memory_order_relaxed);
+	if (fgpIt->second.empty())
+		g_OwnedPointers.erase(fgpIt);
+	return erased;
+}
+
+static void DropAllOwnedFor(FaceGenHeadParameters* fgp)
+{
+	if (!fgp) return;
+	std::lock_guard<std::mutex> g(g_OwnedPointersLock);
+	auto fgpIt = g_OwnedPointers.find(fgp);
+	if (fgpIt != g_OwnedPointers.end()) {
+		g_OwnedPointersCount.fetch_sub((int)fgpIt->second.size(), std::memory_order_relaxed);
+		g_OwnedPointers.erase(fgpIt);
+	}
+}
+
+// =====================================================================================
+// [RBRN] Fix 3: per-FGP critical section.
+//
+// Even with allocator tracking, BSTaskManager thread can read FaceGenParams->models.data[i]
+// at the exact instant the main thread is between "free old, write new" steps. For one
+// machine instruction's worth, the pointer is stale/freed and a deref crashes. A mutex
+// keyed by FGP* serializes swap and dtor against each other so neither can interleave.
+//
+// Scope is intentionally narrow: only the FGP-mutating critical region is locked, not the
+// entire SwapFaceGenHeadData body (which also does file I/O for override probing — held
+// over a mutex would serialize all FaceGen across threads needlessly). However, the plan
+// says wrap the whole body — and uncontended std::mutex on Windows is a SRWLOCK (~10-30ns
+// per acquire) and FaceGen frequencies are low, so the simpler "wrap whole body" wins on
+// readability without measurable perf cost. Reverting to fine-grained locking is a simple
+// follow-up if profiling ever shows contention.
+//
+// std::unordered_map element references are stable across insert/rehash (only iterators
+// invalidate), so returning a reference to the mapped mutex is safe for callers to hold
+// past subsequent map insertions.
+// =====================================================================================
+static std::mutex                                              g_FGPLocksMutex;
+static std::unordered_map<FaceGenHeadParameters*, std::mutex>  g_FGPLocks;
+
+static std::mutex& GetFGPLock(FaceGenHeadParameters* fgp)
+{
+	std::lock_guard<std::mutex> g(g_FGPLocksMutex);
+	return g_FGPLocks[fgp];  // default-constructs on miss
+}
 
 const std::vector<const char*> ActorHeadAssetData::ValidComponentNames{
 	"Head",
@@ -240,21 +331,22 @@ FaceGenAgeTextureOverrider::~FaceGenAgeTextureOverrider()
 	ResetAgeTextureScriptOverrides();
 }
 
-void FaceGenAgeTextureOverrider::TrackHeadOverride( Texture Duplicate, Texture Original )
+void FaceGenAgeTextureOverrider::TrackHeadOverride( Texture MutatedTexture, const char* OriginalPath )
 {
 	ScopedLock Guard(Lock);
 
-	SME_ASSERT(Duplicate && Original);
-	SME_ASSERT(OverriddenHeadTextures.count(Duplicate) == 0);
-	OverriddenHeadTextures[Duplicate] = Original;
+	SME_ASSERT(MutatedTexture && OriginalPath);
+	// [RBRN] Fix 8: with in-place mutation, the same TESTexture pointer may be re-mutated on
+	// a later swap. Allow re-tracking — overwrite any existing entry.
+	OverriddenHeadTextures[MutatedTexture] = OriginalPath;
 }
 
-void FaceGenAgeTextureOverrider::UntrackHeadOverride( Texture Duplicate )
+void FaceGenAgeTextureOverrider::UntrackHeadOverride( Texture MutatedTexture )
 {
 	ScopedLock Guard(Lock);
 
-	if (OverriddenHeadTextures.count(Duplicate))
-		OverriddenHeadTextures.erase(Duplicate);
+	if (OverriddenHeadTextures.count(MutatedTexture))
+		OverriddenHeadTextures.erase(MutatedTexture);
 }
 
 void FaceGenAgeTextureOverrider::RegisterAgeTextureScriptOverride( TESNPC* NPC, const char* BasePath )
@@ -386,8 +478,9 @@ std::string FaceGenAgeTextureOverrider::GetAgeTexturePath( TESNPC* NPC, SInt32 A
 		std::string OrgBasePath(CurrentBasePath);
 		if (OverriddenHeadTextures.count(HeadTexture))
 		{
-			// get the base head texture
-			OrgBasePath = InstanceAbstraction::TESTexture::GetPath(OverriddenHeadTextures.at(HeadTexture))->m_data;
+			// [RBRN] Fix 8: tracking map now stores the original path STRING directly
+			// (since in-place mutation discards the original TESTexture pointer).
+			OrgBasePath = OverriddenHeadTextures.at(HeadTexture);
 			DEBUG_MESSAGE("Reset head asset path to %s", OrgBasePath.c_str());
 		}
 		else
@@ -410,6 +503,27 @@ std::string FaceGenAgeTextureOverrider::GetAgeTexturePath( TESNPC* NPC, SInt32 A
 
 void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TESNPC* NPC, bool FixingFaceNormals)
 {
+	if (!FaceGenParams) return;
+
+	// [RBRN] Fix 11: head hot-path early return. Skip when ALL three sources of override
+	// are absent: PerNPC (in HeadAssetOverrides\PerNPC), PerRace fallback files (in
+	// HeadAssetOverrides\PerRace), and gender-variant files inline with race meshes
+	// (Meshes\Characters\<race>\<asset>_M.nif). Each is pre-scanned at plugin load. For
+	// most actors in most modlists this hits — bailing here saves the 9-component
+	// ApplyOverride agent walk (each component does USVFS-virtualized file existence
+	// checks). Reduces hook latency from microseconds to nanoseconds.
+	if (NPC && Race) {
+		const char* RaceName = InstanceAbstraction::GetFormName(Race);
+		if (!FastPath::HeadHasPerNPC(NPC->refID) &&
+			!FastPath::HeadHasPerRace(RaceName) &&
+			!FastPath::HeadRaceHasGenderVariants(RaceName)) {
+			return;
+		}
+	}
+
+	// [RBRN] Fix 3: serialize swap against concurrent dtor + concurrent swap on the same FGP.
+	std::lock_guard<std::mutex> fgpLock(GetFGPLock(FaceGenParams));
+
 	// swap the head model/texture pointer with a newly allocated one
 	// to allow for the changing of the asset paths
 #ifndef NDEBUG
@@ -430,6 +544,12 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 //	FaceGenParams->DebugDump();
 #endif
 
+	// [RBRN] Fix 1 reverted: restoring the sanity check.
+	// Removing it caused SME_ASSERT(OrgModelPath) to fire on player FaceGen at game start
+	// because some engine-owned slots are allocated-with-empty-path (e.g. EarsMale on female,
+	// or eye slots handled via TESEyes/eyeLeft/eyeRight). The original code NULLed those so
+	// they'd be skipped via `NonExtantModel = true` further down. SME_ASSERT calls _wassert
+	// → abort() in release builds, killing the process before CrashLogger can flush.
 	// sanity check, remove invalid model/texture pointers
 	for (int i = FaceGenHeadParameters::kFaceGenData__BEGIN; i < FaceGenHeadParameters::kFaceGenData__END; i++)
 	{
@@ -451,6 +571,23 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 		}
 	}
 
+	// [RBRN] Fix 8: in-place path mutation.
+	//
+	// The shipped Blockhead pattern was: alloc fresh TESModel/TESTexture, copy original path,
+	// optionally apply override path, install in FGP slot. This changes the slot pointer on
+	// every call, even when no override applies — and that pointer change is what triggers
+	// the engine's retry-storm + downstream BSTaskManagerThread race that crashes mounted-NPC
+	// scenes. (The pattern persisted from a much older Blockhead before the engine had the
+	// retry behavior we now observe.)
+	//
+	// New pattern: mutate the engine's TESModel/TESTexture path in place via BSString::Set.
+	// The slot pointer never changes — engine's mental model of FGP is preserved exactly as
+	// vanilla. The only case still requiring slot mutation is non-extant slot + actual
+	// override (rare; engine's slot was NULL but Blockhead wants to install an override).
+	//
+	// This subsumes Fix 7 (path-match short-circuit becomes implicit) and renders Fix 2's
+	// allocator tracking dormant for the common path (no Blockhead allocation = nothing to
+	// track). Fix 2 stays in place to handle the residual non-extant + override allocations.
 	for (int i = FaceGenHeadParameters::kFaceGenData__BEGIN; i < FaceGenHeadParameters::kFaceGenData__END; i++)
 	{
 		InstanceAbstraction::TESModel::Instance OrgModel = (InstanceAbstraction::TESModel::Instance)
@@ -460,131 +597,110 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 
 		bool NonExtantModel = (OrgModel == NULL), NonExtantTexture = (OrgTexture == NULL);
 
+		// ------------ MODEL ------------
 		const char* OrgModelPath = NULL;
-		InstanceAbstraction::TESModel::Instance NewModel = NULL;
 		if (NonExtantModel == false)
 		{
-			// body part's model component is already allocated, so business as usual
-			NewModel = InstanceAbstraction::TESModel::CreateInstance();
 			OrgModelPath = InstanceAbstraction::TESModel::GetPath(OrgModel)->m_data;
 			SME_ASSERT(OrgModelPath);
-			InstanceAbstraction::TESModel::GetPath(NewModel)->Set(OrgModelPath);
 		}
 
-		// NPC will NULL when generating heads in the editor's Race edit dialog
 		if (NPC == NULL)
 		{
-			if (NewModel)
-				FaceGenParams->models.data[i] = (::TESModel*)NewModel;
+			// Editor's Race edit dialog: leave the engine's TESModel alone. The original
+			// "make a copy" dance was for a defunct CSE preview path; in-place leaves the
+			// engine state unchanged, which is the conservative choice.
 		}
 		else
 		{
 			ActorHeadAssetData Data(ActorHeadAssetData::kAssetType_Model, i, NPC, OrgModelPath);
-			char OverridePath[MAX_PATH] = {0};
 			std::string ResultPath;
-
-			bool ReplacePointer = true;
 			bool OverrideOp = ActorAssetOverriderKernel::Instance.ApplyOverride(&Data, ResultPath);
+
 			if (NonExtantModel)
 			{
-				if (OverrideOp == false)
+				// Engine's slot is NULL. The only way to install an override is to allocate
+				// a TESModel and put it in the slot — slot mutation unavoidable here.
+				if (OverrideOp)
 				{
-					// no overrides for nonextant part, don't bother replacing the pointer
-					ReplacePointer = false;
+					InstanceAbstraction::TESModel::Instance NewModel = InstanceAbstraction::TESModel::CreateInstance();
+					InstanceAbstraction::TESModel::GetPath(NewModel)->Set(ResultPath.c_str());
+					FaceGenParams->models.data[i] = (::TESModel*)NewModel;
+					TrackOwnedPointer(FaceGenParams, NewModel);
+
+					if (i == FaceGenHeadParameters::kFaceGenData_EyesLeft)
+						FaceGenParams->eyeLeft = (::TESModel*)NewModel;
+					else if (i == FaceGenHeadParameters::kFaceGenData_EyesRight)
+						FaceGenParams->eyeRight = (::TESModel*)NewModel;
 				}
-				else
-				{
-					// we've got an override, allocate a new pointer
-					NewModel = InstanceAbstraction::TESModel::CreateInstance();
-				}
+				// no-op when no override on a non-extant slot
 			}
-
-			FORMAT_STR(OverridePath, "%s", ResultPath.c_str());
-
-			if (ReplacePointer)
+			else if (OrgModelPath && _stricmp(ResultPath.c_str(), OrgModelPath) != 0)
 			{
-				SME_ASSERT(NewModel);
-				InstanceAbstraction::TESModel::GetPath(NewModel)->Set(OverridePath);
-
-				// finally swap the pointers, which will be released in the subsequent call to the facegen parameter object's dtor
-				FaceGenParams->models.data[i] = (::TESModel*)NewModel;
-
-				// eyes need special casing because Bethesda
-				if (i == FaceGenHeadParameters::kFaceGenData_EyesLeft)
-					FaceGenParams->eyeLeft = (::TESModel*)NewModel;
-				else if (i == FaceGenHeadParameters::kFaceGenData_EyesRight)
-					FaceGenParams->eyeRight = (::TESModel*)NewModel;
+				// In-place path mutation: same TESModel pointer, new path. Engine sees no
+				// pointer change — vanilla-equivalent slot stability.
+				InstanceAbstraction::TESModel::GetPath(OrgModel)->Set(ResultPath.c_str());
 			}
+			// else: paths match (whether OverrideOp or not), nothing to do
 		}
 
-		// the same for the texture component
+		// ------------ TEXTURE ------------
 		const char* OrgTexturePath = NULL;
-		InstanceAbstraction::TESTexture::Instance NewTexture = NULL;
 		if (NonExtantTexture == false)
 		{
-			NewTexture = InstanceAbstraction::TESTexture::CreateInstance();
 			OrgTexturePath = InstanceAbstraction::TESTexture::GetPath(OrgTexture)->m_data;
 			SME_ASSERT(OrgTexturePath);
-			InstanceAbstraction::TESTexture::GetPath(NewTexture)->Set(OrgTexturePath);
 		}
 
 		if (NPC == NULL)
 		{
-			if (NewTexture)
-				FaceGenParams->textures.data[i] = (::TESTexture*)NewTexture;
+			// Editor mode: same as model — leave engine state alone.
 		}
 		else
 		{
 			ActorHeadAssetData Data(ActorHeadAssetData::kAssetType_Texture, i, NPC, OrgTexturePath);
-			char OverridePath[MAX_PATH] = {0};
 			std::string ResultPath;
-
-			bool ReplacePointer = true;
 			bool OverrideOp = ActorAssetOverriderKernel::Instance.ApplyOverride(&Data, ResultPath);
+
 			if (NonExtantTexture)
 			{
-				if (OverrideOp == false)
-					ReplacePointer = false;
-				else
-					NewTexture = InstanceAbstraction::TESTexture::CreateInstance();
+				if (OverrideOp)
+				{
+					InstanceAbstraction::TESTexture::Instance NewTexture = InstanceAbstraction::TESTexture::CreateInstance();
+					InstanceAbstraction::TESTexture::GetPath(NewTexture)->Set(ResultPath.c_str());
+					FaceGenParams->textures.data[i] = (::TESTexture*)NewTexture;
+					TrackOwnedPointer(FaceGenParams, NewTexture);
+					// Non-extant + override: no original path to remember for age textures.
+					// Age overlay defaults to the override path's base, which is reasonable.
+				}
 			}
-
-			FORMAT_STR(OverridePath, "%s", ResultPath.c_str());
-
-			if (ReplacePointer)
+			else if (OrgTexturePath && _stricmp(ResultPath.c_str(), OrgTexturePath) != 0)
 			{
-				SME_ASSERT(NewTexture);
-
-				// save the original TESTexture pointer of kFaceGenData_Head when an override is active
-				// we check it later to fixup the age overlay texture paths
+				// In-place mutation. For the head texture, remember the pre-override path
+				// so the age-texture overlay system can fall back to it.
 				if (i == FaceGenHeadParameters::kFaceGenData_Head && OverrideOp)
-					FaceGenAgeTextureOverrider::Instance.TrackHeadOverride(NewTexture, OrgTexture);
+					FaceGenAgeTextureOverrider::Instance.TrackHeadOverride(OrgTexture, OrgTexturePath);
 
-				InstanceAbstraction::TESTexture::GetPath(NewTexture)->Set(OverridePath);
-				FaceGenParams->textures.data[i] = (::TESTexture*)NewTexture;
+				InstanceAbstraction::TESTexture::GetPath(OrgTexture)->Set(ResultPath.c_str());
 			}
 		}
 	}
 
+	// [RBRN] Fix 8: hair gets the same in-place treatment. Original code unconditionally
+	// allocated a new TESHair and replaced FaceGenParams->hair on every call, even when the
+	// gender-variant override didn't apply. Now we mutate the engine's TESHair model/texture
+	// paths in place only when the variant file actually exists.
 	if (FaceGenParams->hair)
 	{
-		InstanceAbstraction::TESHair::Instance NewHair = InstanceAbstraction::TESHair::CreateInstance();
 		InstanceAbstraction::TESHair::Instance OldHair = (InstanceAbstraction::TESHair::Instance)FaceGenParams->hair;
-		InstanceAbstraction::TESHair::CopyFlags(OldHair, NewHair);
-
-		InstanceAbstraction::BSString* OldModel = InstanceAbstraction::TESModel::GetPath(InstanceAbstraction::TESHair::GetModel(OldHair));
-		InstanceAbstraction::BSString* OldTexture = InstanceAbstraction::TESTexture::GetPath(InstanceAbstraction::TESHair::GetTexture(OldHair));
-		InstanceAbstraction::BSString* NewModel = InstanceAbstraction::TESModel::GetPath(InstanceAbstraction::TESHair::GetModel(NewHair));
-		InstanceAbstraction::BSString* NewTexture = InstanceAbstraction::TESTexture::GetPath(InstanceAbstraction::TESHair::GetTexture(NewHair));
-
-		if (OldModel->m_data)
-			NewModel->Set(OldModel->m_data);
+		InstanceAbstraction::BSString* HairModelPath = InstanceAbstraction::TESModel::GetPath(InstanceAbstraction::TESHair::GetModel(OldHair));
+		InstanceAbstraction::BSString* HairTexturePath = InstanceAbstraction::TESTexture::GetPath(InstanceAbstraction::TESHair::GetTexture(OldHair));
 
 		if (Settings::kHeadOverrideHairGenderVariantModel().i)
 		{
-			if (OldModel->m_data)
+			if (HairModelPath->m_data)
 			{
-				std::string AssetPath(OldModel->m_data);
+				std::string AssetPath(HairModelPath->m_data);
 				AssetPath.erase(AssetPath.length() - 4, 4);		// remove extension
 				if (FaceGenParams->female)
 					AssetPath += "-F.nif";
@@ -598,7 +714,7 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 #endif
 				if (InstanceAbstraction::FileFinder::GetFileExists(OverridePath.c_str()))
 				{
-					NewModel->Set(AssetPath.c_str());
+					HairModelPath->Set(AssetPath.c_str());
 					DEBUG_MESSAGE("Hair asset override applied");
 				}
 #ifndef NDEBUG
@@ -607,14 +723,11 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 			}
 		}
 
-		if (OldTexture->m_data)
-			NewTexture->Set(OldTexture->m_data);
-
 		if (Settings::kHeadOverrideHairGenderVariantTexture().i)
 		{
-			if (OldTexture->m_data)
+			if (HairTexturePath->m_data)
 			{
-				std::string AssetPath(OldTexture->m_data);
+				std::string AssetPath(HairTexturePath->m_data);
 				AssetPath.erase(AssetPath.length() - 4, 4);		// remove extension
 				if (FaceGenParams->female)
 					AssetPath += "-F.dds";
@@ -628,7 +741,7 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 #endif
 				if (InstanceAbstraction::FileFinder::GetFileExists(OverridePath.c_str()))
 				{
-					NewTexture->Set(AssetPath.c_str());
+					HairTexturePath->Set(AssetPath.c_str());
 					DEBUG_MESSAGE("Hair asset override applied");
 				}
 #ifndef NDEBUG
@@ -637,7 +750,7 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 			}
 		}
 
-		FaceGenParams->hair = (::TESHair*)NewHair;
+		// [RBRN] Fix 8: no slot replacement for hair — engine's TESHair pointer is preserved.
 	}
 
 #ifndef NDEBUG
@@ -647,6 +760,41 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 
 void __stdcall DoTESRaceGetFaceGenHeadParametersHook(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TESNPC* NPC)
 {
+	// [RBRN] retry-loop guard: if the engine re-queues GetFaceGenHeadParameters with the
+	// same (NPC, FaceGenParams) tuple consecutively, skip the swap. Some NPC base records
+	// (e.g. OOO VirtueRider 000700CC) put the engine into a tight retry loop where each
+	// SwapFaceGenHeadData causes the queued FaceGen task to be re-submitted, leading to a
+	// BSTask-thread UAF crash on Set3D. Single-slot dedup is enough to break the cycle.
+	static thread_local TESNPC* lastNPC = nullptr;
+	static thread_local FaceGenHeadParameters* lastFGP = nullptr;
+	static thread_local UInt32 dupeCount = 0;
+
+	bool isDupe = (NPC == lastNPC && FaceGenParams == lastFGP);
+	if (isDupe) {
+		dupeCount++;
+		if (dupeCount == 1) {
+			_MESSAGE("[RBRN] RETRY-LOOP detected for NPC=%08X FGP=%p - hard-skipping (no engine call)",
+				NPC ? NPC->refID : 0, FaceGenParams);
+		}
+		// [RBRN] Fix 9: do NOT call the engine's original GetFaceGenHeadParameters on
+		// duplicates. The previous "call original to satisfy the engine" approach
+		// (inherited from the prior session's instrumentation) appears to enqueue an
+		// extra QueuedHead on every retry call — which Set3D later dequeues and
+		// dereferences NULL through (mounted-actor patrol crash signature). The first
+		// (non-duplicate) call already populated the FGP; the engine should have what
+		// it needs. If the engine retries indefinitely on the same (NPC, FGP) we'll
+		// see a freeze rather than a crash, which still confirms the hypothesis shape.
+		return;
+	}
+
+	if (dupeCount > 0) {
+		_MESSAGE("[RBRN] RETRY-LOOP ended after %d skipped repeats for NPC=%08X",
+			dupeCount, lastNPC ? lastNPC->refID : 0);
+	}
+	lastNPC = NPC;
+	lastFGP = FaceGenParams;
+	dupeCount = 0;
+
 	// call original function to get the parameters
 	thisCall<void>(InstanceAbstraction::kTESRace_GetFaceGenHeadParameters(), Race, NPC, FaceGenParams);
 
@@ -667,6 +815,19 @@ void __declspec(naked) TESRaceGetFaceGenHeadParametersHook(void)
 
 void __stdcall DoFaceGenHeadParametersDtorHook(FaceGenHeadParameters* FaceGenParams)
 {
+	// [RBRN] Fix 11: ultra-fast path. With Fix 8's in-place mutation, we never allocate
+	// for actors without override files (which is ~all actors). When that's true,
+	// g_OwnedPointersCount stays at 0 and we have nothing to free; skip the lock + slot
+	// iteration entirely and just chain to original. Single relaxed atomic load.
+	if (g_OwnedPointersCount.load(std::memory_order_relaxed) == 0) {
+		thisCall<void>(InstanceAbstraction::kFaceGenHeadParameters_Dtor(), FaceGenParams);
+		return;
+	}
+
+	// [RBRN] Fix 3: serialize dtor against concurrent swap + concurrent dtor on the same FGP.
+	// FaceGenParams is `this` from the engine's __thiscall — never NULL in practice.
+	std::lock_guard<std::mutex> fgpLock(GetFGPLock(FaceGenParams));
+
 	for (int i = FaceGenHeadParameters::kFaceGenData__BEGIN; i < FaceGenHeadParameters::kFaceGenData__END; i++)
 	{
 		if (i < FaceGenParams->models.numObjs)
@@ -674,8 +835,10 @@ void __stdcall DoFaceGenHeadParametersDtorHook(FaceGenHeadParameters* FaceGenPar
 			InstanceAbstraction::TESModel::Instance SneakyBugger = (InstanceAbstraction::TESModel::Instance)
 																FaceGenParams->models.data[i];
 
-			// emancipate the bugger, unto death
-			if (SneakyBugger)
+			// [RBRN] Fix 2: only free pointers Blockhead allocated. ConsumeOwnedPointer returns
+			// false (and skips the FormHeap_Free) when the pointer is engine-owned (wrong-allocator
+			// avoidance) or already freed (double-free avoidance).
+			if (SneakyBugger && ConsumeOwnedPointer(FaceGenParams, SneakyBugger))
 				InstanceAbstraction::TESModel::DeleteInstance(SneakyBugger);
 		}
 
@@ -686,15 +849,22 @@ void __stdcall DoFaceGenHeadParametersDtorHook(FaceGenHeadParameters* FaceGenPar
 
 			if (SneakyBugger)
 			{
-				// remove the cached override data
+				// remove the cached override data (no-op if engine-owned — only Blockhead-allocated
+				// textures are ever entered into the FaceGenAgeTextureOverrider cache)
 				FaceGenAgeTextureOverrider::Instance.UntrackHeadOverride(SneakyBugger);
-				InstanceAbstraction::TESTexture::DeleteInstance(SneakyBugger);
+
+				if (ConsumeOwnedPointer(FaceGenParams, SneakyBugger))
+					InstanceAbstraction::TESTexture::DeleteInstance(SneakyBugger);
 			}
 		}
 	}
 
-	if (FaceGenParams->hair)
+	if (FaceGenParams->hair && ConsumeOwnedPointer(FaceGenParams, FaceGenParams->hair))
 		InstanceAbstraction::TESHair::DeleteInstance(FaceGenParams->hair);
+
+	// [RBRN] Fix 2: clear any residual ownership entries (defensive — shouldn't be any after
+	// the loop above, but FGP buffers are recycled by the engine so we want a clean slate).
+	DropAllOwnedFor(FaceGenParams);
 
 	thisCall<void>(InstanceAbstraction::kFaceGenHeadParameters_Dtor(), FaceGenParams);
 }

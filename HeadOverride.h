@@ -71,10 +71,13 @@ public:
 private:
 	static const char*									kOverrideSourceDirectory;
 
-	typedef std::map<Texture, Texture>					OverrideHeadTextureMapT;
+	// [RBRN] Fix 8: original-path tracking now stores the path STRING rather than a TESTexture
+	// pointer. With in-place mutation of the engine's TESTexture, there is no separate
+	// "original" Texture* — only the original path string captured before mutation.
+	typedef std::map<Texture, std::string>				OverrideHeadTextureMapT;
 	typedef std::map<NPCHandleT, std::string>			AgeTextureBasePathMapT;
 
-	OverrideHeadTextureMapT								OverriddenHeadTextures;		// maps new allocations to their old ones
+	OverrideHeadTextureMapT								OverriddenHeadTextures;		// maps in-place-mutated textures to their pre-override paths
 	AgeTextureBasePathMapT								ScriptOverrides;
 	mutable ICriticalSection							Lock;
 
@@ -87,8 +90,8 @@ public:
 	FaceGenAgeTextureOverrider();
 	~FaceGenAgeTextureOverrider();
 
-	void												TrackHeadOverride(Texture Duplicate, Texture Original);
-	void												UntrackHeadOverride(Texture Duplicate);
+	void												TrackHeadOverride(Texture MutatedTexture, const char* OriginalPath);
+	void												UntrackHeadOverride(Texture MutatedTexture);
 
 	void												RegisterAgeTextureScriptOverride(TESNPC* NPC, const char* BasePath);
 	void												UnregisterAgeTextureScriptOverride(TESNPC* NPC);

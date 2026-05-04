@@ -1,4 +1,5 @@
 #include "BodyOverride.h"
+#include "FastPath.h"
 
 ScriptedActorAssetOverrider<ScriptedTextureOverrideData>		ScriptBodyOverrideAgent::TextureOverrides;
 ScriptedActorAssetOverrider<ScriptedModelOverrideData>			ScriptBodyOverrideAgent::MeshOverrides;
@@ -178,6 +179,19 @@ _DefineHookHdlr(TESRaceGetBodyEGT, 0x0052D612);
 
 void __cdecl SwapRaceBodyTexture(TESRace* Race, UInt8 BodyPart, TESNPC* NPC, InstanceAbstraction::BSString* OutTexPath, const char* Format, const char* OrgTexPath)
 {
+	// [RBRN] Fix 11: hot-path early return. If neither this NPC nor its race has body
+	// overrides, replicate the engine's vanilla behavior (write the original path) and
+	// skip the agent walk entirely.
+	if (NPC && Race &&
+		!FastPath::BodyHasPerNPC(NPC->refID) &&
+		!FastPath::BodyHasPerRace(InstanceAbstraction::GetFormName(Race)))
+	{
+		char OverrideTexPath[MAX_PATH] = {0};
+		FORMAT_STR(OverrideTexPath, "Textures\\%s", OrgTexPath ? OrgTexPath : "");
+		OutTexPath->Set(OverrideTexPath);
+		return;
+	}
+
 	ActorBodyAssetData Data(ActorBodyAssetData::kAssetType_Texture, BodyPart, NPC, OrgTexPath);
 	char OverrideTexPath[MAX_PATH] = {0};
 	std::string ResultPath;
@@ -211,6 +225,17 @@ TESModel* __stdcall SwapRaceBodyModel(TESNPC* NPC, TESRace* Race, UInt32 Gender,
 	// get the model thingy
 	TESModel* Original = thisCall<TESModel*>(0x0052BE80, Race, Gender, BodyPart);
 
+	// [RBRN] Fix 11: hot-path early return. Vast majority of actors have no body overrides;
+	// for them, return the engine's original pointer unchanged â€” same as shadeMe's existing
+	// "no override and path matches" guard further down, but reached without ApplyOverride's
+	// agent-walk + file-existence checks.
+	if (NPC && Race &&
+		!FastPath::BodyHasPerNPC(NPC->refID) &&
+		!FastPath::BodyHasPerRace(InstanceAbstraction::GetFormName(Race)))
+	{
+		return Original;  // NULL is a valid return per the original semantics
+	}
+
 	bool NonExtantModel = (Original == NULL || Original->nifPath.m_data == NULL);
 	ActorBodyAssetData Data(ActorBodyAssetData::kAssetType_Model, BodyPart, NPC, (NonExtantModel == false ? Original->nifPath.m_data : NULL));
 	std::string ResultPath;
@@ -242,7 +267,7 @@ _hhBegin()
 	_hhSetVar(Retn, 0x0047ABFF);
 	__asm
 	{
-		mov		eax, [esp + 0x14]			// muck around with the stack frame, then you're gonna have a BadTime™
+		mov		eax, [esp + 0x14]			// muck around with the stack frame, then you're gonna have a BadTimeï¿½
 		push	ecx
 		push	eax
 		call	SwapRaceBodyModel
@@ -271,6 +296,17 @@ TESModel* __stdcall SwapRaceBodyFaceGenModel(TESNPC* NPC, UInt32 BodyPart, TESMo
 
 	if (Original == NULL)
 		return Original;
+
+	// [RBRN] Fix 11: hot-path early return. EGT path is body-asset-class; if no body
+	// overrides apply for this NPC or its race, return engine's original unchanged.
+	if (NPC) {
+		TESRace* Race = InstanceAbstraction::GetNPCRace(NPC);
+		if (!FastPath::BodyHasPerNPC(NPC->refID) &&
+			!FastPath::BodyHasPerRace(Race ? InstanceAbstraction::GetFormName(Race) : NULL))
+		{
+			return Original;
+		}
+	}
 
 	ActorBodyAssetData Data(ActorBodyAssetData::kAssetType_BodyEGT, BodyPart, NPC, Original->nifPath.m_data);
 	std::string ResultPath;

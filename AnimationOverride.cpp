@@ -217,6 +217,7 @@ void __stdcall FixupAnimationOverrides(TESObjectREFR* Ref)
 	SME_ASSERT(Ref);
 
 	TESForm* BaseForm = Ref->baseForm;
+
 	if (BaseForm)
 	{
 		TESNPC* NPC = OBLIVION_CAST(BaseForm, TESForm, TESNPC);

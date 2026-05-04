@@ -1,7 +1,7 @@
 // Microsoft Visual C++ generated resource script.
 //
 
-#include "afxres.h"
+#include "winres.h"
 #include "VersionInfo.h"
 
 /////////////////////////////////////////////////////////////////////////////

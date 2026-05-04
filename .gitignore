@@ -30,3 +30,7 @@ _ReSharper*/
 /BuildIncrement.jse
 /BuildInfo.h
 /.vs/
+
+# Blockhead-Reborn fork:
+# Detours/ is a junction to xOBSE's bundled Microsoft Detours; create locally.
+/Detours/

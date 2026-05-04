@@ -5,9 +5,92 @@
 #include "BodyOverride.h"
 #include "AnimationOverride.h"
 #include "EquipmentOverride.h"
+#include "EngineRaceFix.h"
+#include "FastPath.h"
 #include "VersionInfo.h"
 
+#include <windows.h>
+#include <string>
+
 IDebugLog gLog("Blockhead.log");
+
+// =====================================================================================
+// [RBRN] Fix 10: conditional patching.
+//
+// Empirical finding (2026-05-04 session): Blockhead's mere PRESENCE via JMP-redirect
+// hooks adds enough latency to engine call paths to violate the engine's hazard-pointer
+// + deferred-free protocol around IOManager / BSTaskManager (sub_4328B0/sub_432C30/etc),
+// crashing mounted-actor scenes. Disabling every Patch* removes the trigger entirely.
+//
+// Strategy: at plugin load, scan each subsystem's override directory tree. If no files
+// exist for a subsystem, skip its Patch* call — Blockhead becomes invisible to the
+// engine on that code path. For modlists with NO Blockhead overrides (vestigial Blockhead
+// included only because OCO recommends it), this means full vanilla timing throughout.
+// =====================================================================================
+static bool DirHasAnyFile(const char* root, const char* extPattern)
+{
+	// Recursive scan. Returns true on first match. Pattern is e.g. "*.nif" or "*.kf".
+	// MAX_PATH is fine — Oblivion doesn't support long paths anyway.
+	char search[MAX_PATH];
+	_snprintf_s(search, MAX_PATH, _TRUNCATE, "%s\\%s", root, extPattern);
+
+	WIN32_FIND_DATAA fd;
+	HANDLE hFind = FindFirstFileA(search, &fd);
+	if (hFind != INVALID_HANDLE_VALUE) {
+		// We only care if anything exists; a single hit is enough.
+		FindClose(hFind);
+		return true;
+	}
+
+	// Recurse into subdirectories.
+	_snprintf_s(search, MAX_PATH, _TRUNCATE, "%s\\*", root);
+	hFind = FindFirstFileA(search, &fd);
+	if (hFind == INVALID_HANDLE_VALUE)
+		return false;
+
+	bool found = false;
+	do {
+		if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+		if (fd.cFileName[0] == '.') continue;  // skip "." and ".."
+		char child[MAX_PATH];
+		_snprintf_s(child, MAX_PATH, _TRUNCATE, "%s\\%s", root, fd.cFileName);
+		if (DirHasAnyFile(child, extPattern)) {
+			found = true;
+			break;
+		}
+	} while (FindNextFileA(hFind, &fd));
+	FindClose(hFind);
+	return found;
+}
+
+static bool ShouldPatchHeadOverride()
+{
+	// HeadAssetOverrides files: PerNPC/<plugin>/<formID>_<comp>.nif and PerRace/<gender>/<race>_<comp>.nif
+	return DirHasAnyFile("Data\\Meshes\\Characters\\HeadAssetOverrides", "*.nif")
+		|| DirHasAnyFile("Data\\Textures\\Characters\\HeadAssetOverrides", "*.dds");
+}
+
+static bool ShouldPatchBodyOverride()
+{
+	return DirHasAnyFile("Data\\Meshes\\Characters\\BodyAssetOverrides", "*.nif")
+		|| DirHasAnyFile("Data\\Textures\\Characters\\BodyAssetOverrides", "*.dds");
+}
+
+static bool ShouldPatchAnimationOverride()
+{
+	// AnimationOverride only fires if files match Blockhead's "*_BLKD_<TAG>.kf" pattern,
+	// otherwise the IDirectoryIterator returns 0 results per call. _BLKD_-tagged files
+	// only — files in SpecialAnims/IdleAnims without the tag are loaded by the engine
+	// natively, NOT by Blockhead.
+	return DirHasAnyFile("Data\\Meshes\\Characters\\_male\\SpecialAnims", "*_BLKD_*.kf")
+		|| DirHasAnyFile("Data\\Meshes\\Characters\\_male\\IdleAnims", "*_BLKD_*.kf");
+}
+
+static bool ShouldPatchEquipmentOverride()
+{
+	return DirHasAnyFile("Data\\Meshes\\Characters\\EquipmentAssetOverrides", "*.nif")
+		|| DirHasAnyFile("Data\\Textures\\Characters\\EquipmentAssetOverrides", "*.dds");
+}
 
 
 static void LoadCallbackHandler(void * reserved)
@@ -171,10 +254,24 @@ extern "C"
 		}
 
 		_MESSAGE("Pah! There's no pleasing some horses!\n\n");
+		_MESSAGE("===== REBORN INSTRUMENTED BUILD %d.%d.%d.%d (Release) LOADED =====", VERSION_MAJOR, VERSION_MINOR, VERSION_REVISION, VERSION_BUILD);
+		_MESSAGE("[RBRN] Build identifier: gnarlyman/Blockhead investigation fork");
 		gLog.Indent();
 
 
 		RegisterCommands(obse);
+
+		// [RBRN] Fix 11: pre-scan override directories to build fast-path sets BEFORE
+		// installing patches. Hooks check the sets first; for actors with no override,
+		// hooks fast-return in a few nanoseconds, well below the engine race threshold.
+		FastPath::ScanAtStartup();
+
+		// [RBRN] Refined Option A: NOP the engine's bucket-array FormHeapFree calls so
+		// the LockFreeMap's deferred-free GC can never produce a UAF. See EngineRaceFix.cpp.
+		EngineRaceFix::Install();
+
+		// All patches installed unconditionally; Fix 11's fast-paths in the hook bodies
+		// keep latency low enough that the engine's hazard-pointer protocol holds.
 		PatchHeadOverride();
 		PatchBodyOverride();
 		PatchAnimationOverride();
