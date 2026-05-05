@@ -171,6 +171,7 @@
     <ClCompile Include="Commands.cpp" />
     <ClCompile Include="EngineRaceFix.cpp" />
     <ClCompile Include="EquipmentOverride.cpp" />
+    <ClCompile Include="FaceGenDataScanner.cpp" />
     <ClCompile Include="FastPath.cpp" />
     <ClCompile Include="HeadOverride.cpp" />
     <ClCompile Include="Main.cpp" />
@@ -212,6 +213,7 @@
     <ClInclude Include="Commands.h" />
     <ClInclude Include="EngineRaceFix.h" />
     <ClInclude Include="EquipmentOverride.h" />
+    <ClInclude Include="FaceGenDataScanner.h" />
     <ClInclude Include="FastPath.h" />
     <ClInclude Include="HeadOverride.h" />
     <ClInclude Include="Sundries.h" />

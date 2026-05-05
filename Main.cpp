@@ -6,6 +6,7 @@
 #include "AnimationOverride.h"
 #include "EquipmentOverride.h"
 #include "EngineRaceFix.h"
+#include "FaceGenDataScanner.h"
 #include "FastPath.h"
 #include "VersionInfo.h"
 
@@ -99,6 +100,7 @@ static void LoadCallbackHandler(void * reserved)
 	HeadOverride::HandleLoadGame();
 	AnimOverride::HandleLoadGame();
 	EquipmentOverride::HandleLoadGame();
+	FaceGenDataScanner::Scan();
 }
 
 static void SaveCallbackHandler(void * reserved)
@@ -112,6 +114,7 @@ static void NewGameCallbackHandler(void * reserved)
 	HeadOverride::HandleLoadGame();
 	AnimOverride::HandleLoadGame();
 	EquipmentOverride::HandleLoadGame();
+	FaceGenDataScanner::Scan();
 }
 
 void BlockheadMessageHandler(OBSEMessagingInterface::Message* Msg)
