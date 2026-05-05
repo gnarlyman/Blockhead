@@ -1,5 +1,6 @@
 #include "HeadOverride.h"
 #include "FastPath.h"
+#include "EngineRaceFix.h"
 
 #include <atomic>
 #include <mutex>
@@ -64,35 +65,6 @@ static void DropAllOwnedFor(FaceGenHeadParameters* fgp)
 		g_OwnedPointersCount.fetch_sub((int)fgpIt->second.size(), std::memory_order_relaxed);
 		g_OwnedPointers.erase(fgpIt);
 	}
-}
-
-// =====================================================================================
-// [RBRN] Fix 3: per-FGP critical section.
-//
-// Even with allocator tracking, BSTaskManager thread can read FaceGenParams->models.data[i]
-// at the exact instant the main thread is between "free old, write new" steps. For one
-// machine instruction's worth, the pointer is stale/freed and a deref crashes. A mutex
-// keyed by FGP* serializes swap and dtor against each other so neither can interleave.
-//
-// Scope is intentionally narrow: only the FGP-mutating critical region is locked, not the
-// entire SwapFaceGenHeadData body (which also does file I/O for override probing — held
-// over a mutex would serialize all FaceGen across threads needlessly). However, the plan
-// says wrap the whole body — and uncontended std::mutex on Windows is a SRWLOCK (~10-30ns
-// per acquire) and FaceGen frequencies are low, so the simpler "wrap whole body" wins on
-// readability without measurable perf cost. Reverting to fine-grained locking is a simple
-// follow-up if profiling ever shows contention.
-//
-// std::unordered_map element references are stable across insert/rehash (only iterators
-// invalidate), so returning a reference to the mapped mutex is safe for callers to hold
-// past subsequent map insertions.
-// =====================================================================================
-static std::mutex                                              g_FGPLocksMutex;
-static std::unordered_map<FaceGenHeadParameters*, std::mutex>  g_FGPLocks;
-
-static std::mutex& GetFGPLock(FaceGenHeadParameters* fgp)
-{
-	std::lock_guard<std::mutex> g(g_FGPLocksMutex);
-	return g_FGPLocks[fgp];  // default-constructs on miss
 }
 
 const std::vector<const char*> ActorHeadAssetData::ValidComponentNames{
@@ -521,9 +493,6 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 		}
 	}
 
-	// [RBRN] Fix 3: serialize swap against concurrent dtor + concurrent swap on the same FGP.
-	std::lock_guard<std::mutex> fgpLock(GetFGPLock(FaceGenParams));
-
 	// swap the head model/texture pointer with a newly allocated one
 	// to allow for the changing of the asset paths
 #ifndef NDEBUG
@@ -760,43 +729,29 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 
 void __stdcall DoTESRaceGetFaceGenHeadParametersHook(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TESNPC* NPC)
 {
-	// [RBRN] retry-loop guard: if the engine re-queues GetFaceGenHeadParameters with the
-	// same (NPC, FaceGenParams) tuple consecutively, skip the swap. Some NPC base records
-	// (e.g. OOO VirtueRider 000700CC) put the engine into a tight retry loop where each
-	// SwapFaceGenHeadData causes the queued FaceGen task to be re-submitted, leading to a
-	// BSTask-thread UAF crash on Set3D. Single-slot dedup is enough to break the cycle.
+	// [RBRN] Fix 9: dedup consecutive identical (NPC, FGP) calls per thread.
+	// The engine sometimes retries GetFaceGenHeadParameters on the same tuple in a
+	// tight loop. Without this guard the perf degrades visibly even on healthy NPCs;
+	// removing it in the v513 strip test reproduced the loop. The skip is safe — the
+	// first non-duplicate call has already populated FGP, so the engine has what it
+	// needs.
 	static thread_local TESNPC* lastNPC = nullptr;
 	static thread_local FaceGenHeadParameters* lastFGP = nullptr;
-	static thread_local UInt32 dupeCount = 0;
 
-	bool isDupe = (NPC == lastNPC && FaceGenParams == lastFGP);
-	if (isDupe) {
-		dupeCount++;
-		if (dupeCount == 1) {
-			_MESSAGE("[RBRN] RETRY-LOOP detected for NPC=%08X FGP=%p - hard-skipping (no engine call)",
-				NPC ? NPC->refID : 0, FaceGenParams);
-		}
-		// [RBRN] Fix 9: do NOT call the engine's original GetFaceGenHeadParameters on
-		// duplicates. The previous "call original to satisfy the engine" approach
-		// (inherited from the prior session's instrumentation) appears to enqueue an
-		// extra QueuedHead on every retry call — which Set3D later dequeues and
-		// dereferences NULL through (mounted-actor patrol crash signature). The first
-		// (non-duplicate) call already populated the FGP; the engine should have what
-		// it needs. If the engine retries indefinitely on the same (NPC, FGP) we'll
-		// see a freeze rather than a crash, which still confirms the hypothesis shape.
+	if (NPC == lastNPC && FaceGenParams == lastFGP) {
 		return;
-	}
-
-	if (dupeCount > 0) {
-		_MESSAGE("[RBRN] RETRY-LOOP ended after %d skipped repeats for NPC=%08X",
-			dupeCount, lastNPC ? lastNPC->refID : 0);
 	}
 	lastNPC = NPC;
 	lastFGP = FaceGenParams;
-	dupeCount = 0;
 
 	// call original function to get the parameters
 	thisCall<void>(InstanceAbstraction::kTESRace_GetFaceGenHeadParameters(), Race, NPC, FaceGenParams);
+
+	// Diagnostic: register FGP-to-NPC mapping for Layer 4's FGP-DUMP path. Done
+	// AFTER the engine populates the FGP so the FGP pointer is stable.
+	if (FaceGenParams && NPC) {
+		EngineRaceFix::RegisterFGP_NPC(FaceGenParams, NPC->refID);
+	}
 
 	SwapFaceGenHeadData(Race, FaceGenParams, NPC, false);
 }
@@ -815,6 +770,11 @@ void __declspec(naked) TESRaceGetFaceGenHeadParametersHook(void)
 
 void __stdcall DoFaceGenHeadParametersDtorHook(FaceGenHeadParameters* FaceGenParams)
 {
+	// Diagnostic: drop FGP-to-NPC mapping FIRST, before any fast-path return,
+	// so every FGP destruction gets a clean slate (FGP slots are heavily recycled
+	// in the worker thread).
+	EngineRaceFix::UnregisterFGP(FaceGenParams);
+
 	// [RBRN] Fix 11: ultra-fast path. With Fix 8's in-place mutation, we never allocate
 	// for actors without override files (which is ~all actors). When that's true,
 	// g_OwnedPointersCount stays at 0 and we have nothing to free; skip the lock + slot
@@ -823,10 +783,6 @@ void __stdcall DoFaceGenHeadParametersDtorHook(FaceGenHeadParameters* FaceGenPar
 		thisCall<void>(InstanceAbstraction::kFaceGenHeadParameters_Dtor(), FaceGenParams);
 		return;
 	}
-
-	// [RBRN] Fix 3: serialize dtor against concurrent swap + concurrent dtor on the same FGP.
-	// FaceGenParams is `this` from the engine's __thiscall — never NULL in practice.
-	std::lock_guard<std::mutex> fgpLock(GetFGPLock(FaceGenParams));
 
 	for (int i = FaceGenHeadParameters::kFaceGenData__BEGIN; i < FaceGenHeadParameters::kFaceGenData__END; i++)
 	{
