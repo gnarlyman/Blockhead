@@ -11,50 +11,30 @@ namespace EngineRaceFix
 	// =============================================================================
 	// [RBRN] BSFaceGen FGP-corruption-tolerant fix stack.
 	//
-	// Four layers, each addressing a distinct manifestation of the same underlying
-	// condition: BSFaceGen worker thread receives an FGP-shaped struct whose
-	// NiTArray data pointers are NULL. v513-v517 strip-and-trace investigation
-	// (2026-05-04) confirmed the storm originates from sub_52DED0 (called from
-	// sub_5227A0 with hardcoded flag=1 at 0x005232A9). The "corrupt FGP" is
-	// actually a DIFFERENT struct (0x1E0 / 0x118 bytes — real FGP is 0xC4) that
-	// happens to have NiTArray-shaped fields at +0x78 / +0x88 / +0x98. The
-	// arrays are constructed-but-empty (vtable set, data=NULL) which is normal
-	// post-construction state. Layer 4 catches the precondition violation when
-	// DoSomething is called on these unpopulated objects. See
-	// feedback_facegen_storm_root_cause.md.
+	// Layered fixes addressing successive crash signatures observed during the
+	// 2026-05-04 investigation:
 	//
-	//   Layer 1. LFM bucket-array FormHeapFree NOPs — NOPs the two
-	//      `call FormHeapFree` instructions at 0x43296E and 0x4327EC inside
-	//      the LockFreeMap resize routines (sub_4328B0 and sister sub_432740).
-	//      The bucket arrays are leaked but the use-after-free window is
-	//      closed. v518 strip-test (initial brief) suggested this was
-	//      redundant; v518 extended play (2026-05-05) reproduced the original
-	//      sub_4328B0+0x5A crash, confirming Layer 1 is load-bearing.
-	//      Bounded leak (single-digit KB per session per chain).
+	//   1. LFM bucket-array FormHeapFree NOPs (refined Option A) — kills the
+	//      original sub_432C30+0x44 LFM bucket-array UAF.
 	//
-	//   Layer 2. sub_52DED0 worker face-load chokepoint mutex — wraps the
-	//      worker chain (BSTaskThread_Runnable -> sub_523220 -> sub_9F88B0 ->
-	//      sub_5547F0) so it can't read FGP slots while the main thread is
-	//      mid-mutation. Without this, the worker AVs at sub_5547F0+0x2E9.
+	//   2. sub_52DED0 chokepoint mutex — serializes worker face-load chain.
+	//      Killed the NiObjectNET::SetName+0x4 relocation crash.
 	//
-	//   Layer 3. AgeMorphTable validation-failure redirect — replaces call to
+	//   3. AgeMorphTable validation-failure redirect — replaces call to
 	//      _invalid_parameter at 0x006EDDD4 with jmp to existing "return 0.0"
-	//      early-exit path at 0x006EDD8F. Independent CRT-fail-fast bug class
-	//      that fires from any code path hitting AgeMorphTable::Lookup with an
-	//      empty morph vector. 5-byte binary patch.
+	//      early-exit path at 0x006EDD8F. Killed the empty-morph-vector crash.
 	//
-	//   Layer 4. BSFaceGen_DoSomething FGP-validation hook — validates the
-	//      FGP's models.data / textures.data / third array pointers (offsets
-	//      0x78, 0x88, 0x98) at function entry; bails cleanly if any are null.
-	//      Primary defense; fires ~2500 times per session in mounted-patrol
-	//      streams.
+	//   4. BSFaceGen_DoSomethingWithFaceGenNode FGP-validation hook (NEW) —
+	//      catches null FGP.models.data (ebp+0x78) and similar early null fields,
+	//      bails out cleanly via skip path. Targets the AV at +0x179.
 	//
-	// Removed in v515 strip-test (no regression observed): per-FGP g_FGPLocks
-	// lock-map (still confirmed redundant; Fix 8's in-place mutation makes the
-	// lock unnecessary for the common case).
+	// All fixes target the corrupted FaceGenHeadParameters bug class. The FGP
+	// passed to worker face-load chain has critical fields zero/garbage when
+	// streaming patrol NPCs under OCO. Each layer either validates the data
+	// before the engine reads it, or reroutes the failure to a graceful path.
 	// =============================================================================
 
-	// LFM bucket-array FormHeapFree NOPs (Layer 1).
+	// LFM bucket-array FormHeapFree NOPs (refined Option A).
 	_DefineNopHdlr(BucketArrayFreeChainA, 0x0043296E, 5);
 	_DefineNopHdlr(BucketArrayFreeChainB, 0x004327EC, 5);
 
@@ -79,11 +59,24 @@ namespace EngineRaceFix
 		LeaveCriticalSection(&s_facegenLock);
 	}
 
+	// Validate FGP critical fields before letting the engine deref them.
+	// FGP layout (per BlockheadInternals.h:103-152, sizeof 0xC4):
+	//   +0x70: gender flag
+	//   +0x78: models.data (NiTArray internal pointer to TESModel*[])
+	//   +0x88: textures.data (similar)
+	//   +0x98: third array data
+	//   +0xb8: eyeLeft (interior pointer into TESRace)
+	//   +0xbc: eyeRight
+	//
+	// When any of the array data pointers are null, the engine's read at
+	// 0x00555339 / similar offsets AVs. We bail out cleanly — same effect as
+	// the engine's existing "skip slot" path at 0x5556de but applied at
+	// function entry.
 	static void __cdecl hook_DoSomething(void* faceGenNode, void* faceGenParams)
 	{
 		if (!faceGenParams) {
 			LONG n = InterlockedIncrement(&s_doSomethingSkipCount);
-			if (n <= 5 || (n % 1000) == 0) {
+			if (n <= 5 || (n % 100) == 0) {
 				_MESSAGE("[RBRN] DoSomething skip #%ld: null FGP", n);
 			}
 			return;
@@ -96,8 +89,9 @@ namespace EngineRaceFix
 
 		if (!models || !textures || !third) {
 			LONG n = InterlockedIncrement(&s_doSomethingSkipCount);
-			if (n <= 5 || (n % 1000) == 0) {
-				_MESSAGE("[RBRN] DoSomething skip #%ld: null array FGP=%p", n, faceGenParams);
+			if (n <= 5 || (n % 100) == 0) {
+				_MESSAGE("[RBRN] DoSomething skip #%ld: null array (models=%p textures=%p third=%p) FGP=%p",
+				         n, models, textures, third, faceGenParams);
 			}
 			return;
 		}
@@ -112,7 +106,7 @@ namespace EngineRaceFix
 		// Layer 1: LFM NOPs.
 		_MemHdlr(BucketArrayFreeChainA).WriteNop();
 		_MemHdlr(BucketArrayFreeChainB).WriteNop();
-		_MESSAGE("[RBRN] EngineRaceFix: LFM bucket-array FormHeapFree NOPs applied (0x0043296E + 0x004327EC)");
+		_MESSAGE("[RBRN] EngineRaceFix: LFM bucket-array FormHeapFree NOPs applied");
 
 		// Layer 3: AgeMorphTable validation-failure redirect (0x006EDDD4 -> 0x006EDD8F).
 		WriteRelJump(0x006EDDD4, 0x006EDD8F);
