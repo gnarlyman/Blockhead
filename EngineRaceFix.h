@@ -35,12 +35,4 @@ namespace EngineRaceFix
 	// Detach the Detours hook (binary patch is left in place; runtime never
 	// unloads OBSE plugins anyway).
 	void Uninstall();
-
-	// Diagnostic: register FGP-to-NPC mapping so the Layer 4 skip hook can
-	// identify which NPC is being processed. Called from
-	// HeadOverride::DoTESRaceGetFaceGenHeadParametersHook after the engine's
-	// GetFaceGenHeadParameters has populated the FGP. UnregisterFGP is called
-	// from the FGP destructor hook.
-	void RegisterFGP_NPC(void* fgp, unsigned int npcRefID);
-	void UnregisterFGP(void* fgp);
 }

@@ -1,6 +1,5 @@
 #include "HeadOverride.h"
 #include "FastPath.h"
-#include "EngineRaceFix.h"
 
 #include <atomic>
 #include <mutex>
@@ -747,12 +746,6 @@ void __stdcall DoTESRaceGetFaceGenHeadParametersHook(TESRace* Race, FaceGenHeadP
 	// call original function to get the parameters
 	thisCall<void>(InstanceAbstraction::kTESRace_GetFaceGenHeadParameters(), Race, NPC, FaceGenParams);
 
-	// Diagnostic: register FGP-to-NPC mapping for Layer 4's FGP-DUMP path. Done
-	// AFTER the engine populates the FGP so the FGP pointer is stable.
-	if (FaceGenParams && NPC) {
-		EngineRaceFix::RegisterFGP_NPC(FaceGenParams, NPC->refID);
-	}
-
 	SwapFaceGenHeadData(Race, FaceGenParams, NPC, false);
 }
 
@@ -770,11 +763,6 @@ void __declspec(naked) TESRaceGetFaceGenHeadParametersHook(void)
 
 void __stdcall DoFaceGenHeadParametersDtorHook(FaceGenHeadParameters* FaceGenParams)
 {
-	// Diagnostic: drop FGP-to-NPC mapping FIRST, before any fast-path return,
-	// so every FGP destruction gets a clean slate (FGP slots are heavily recycled
-	// in the worker thread).
-	EngineRaceFix::UnregisterFGP(FaceGenParams);
-
 	// [RBRN] Fix 11: ultra-fast path. With Fix 8's in-place mutation, we never allocate
 	// for actors without override files (which is ~all actors). When that's true,
 	// g_OwnedPointersCount stays at 0 and we have nothing to free; skip the lock + slot
