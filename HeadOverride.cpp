@@ -505,21 +505,14 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 {
 	if (!FaceGenParams) return;
 
-	// [RBRN] Fix 11: head hot-path early return. Skip when ALL three sources of override
-	// are absent: PerNPC (in HeadAssetOverrides\PerNPC), PerRace fallback files (in
-	// HeadAssetOverrides\PerRace), and gender-variant files inline with race meshes
-	// (Meshes\Characters\<race>\<asset>_M.nif). Each is pre-scanned at plugin load. For
-	// most actors in most modlists this hits — bailing here saves the 9-component
-	// ApplyOverride agent walk (each component does USVFS-virtualized file existence
-	// checks). Reduces hook latency from microseconds to nanoseconds.
-	if (NPC && Race) {
-		const char* RaceName = InstanceAbstraction::GetFormName(Race);
-		if (!FastPath::HeadHasPerNPC(NPC->refID) &&
-			!FastPath::HeadHasPerRace(RaceName) &&
-			!FastPath::HeadRaceHasGenderVariants(RaceName)) {
-			return;
-		}
-	}
+	// [RBRN] Fix 11 REMOVED 2026-05-05: the FastPath early-return was incorrectly bailing
+	// for NPCs whose overrides come through the script agent (ScriptHeadOverrideAgent,
+	// runtime-registered via OBSE script commands like SetBodyAssetOverride / OCOv2's
+	// face-load hooks). FastPath only scans HeadAssetOverrides\PerNPC and PerRace
+	// directory trees — it doesn't see script-registered overrides. Bailing meant
+	// vanilla NPCs lost their OCO faces and showed "Install Blockhead" placeholder.
+	// Restoring shadeMe's original behavior: every actor's swap goes through all four
+	// override agents (PerNPC, Script, PerRace, Default) as ApplyOverride iterates.
 
 	// [RBRN] Fix 3: serialize swap against concurrent dtor + concurrent swap on the same FGP.
 	std::lock_guard<std::mutex> fgpLock(GetFGPLock(FaceGenParams));
