@@ -11,7 +11,7 @@ namespace EngineRaceFix
 	// =============================================================================
 	// [RBRN] BSFaceGen FGP-corruption-tolerant fix stack.
 	//
-	// Three layers, each addressing a distinct manifestation of the same underlying
+	// Four layers, each addressing a distinct manifestation of the same underlying
 	// condition: BSFaceGen worker thread receives an FGP-shaped struct whose
 	// NiTArray data pointers are NULL. v513-v517 strip-and-trace investigation
 	// (2026-05-04) confirmed the storm originates from sub_52DED0 (called from
@@ -22,6 +22,15 @@ namespace EngineRaceFix
 	// post-construction state. Layer 4 catches the precondition violation when
 	// DoSomething is called on these unpopulated objects. See
 	// feedback_facegen_storm_root_cause.md.
+	//
+	//   Layer 1. LFM bucket-array FormHeapFree NOPs — NOPs the two
+	//      `call FormHeapFree` instructions at 0x43296E and 0x4327EC inside
+	//      the LockFreeMap resize routines (sub_4328B0 and sister sub_432740).
+	//      The bucket arrays are leaked but the use-after-free window is
+	//      closed. v518 strip-test (initial brief) suggested this was
+	//      redundant; v518 extended play (2026-05-05) reproduced the original
+	//      sub_4328B0+0x5A crash, confirming Layer 1 is load-bearing.
+	//      Bounded leak (single-digit KB per session per chain).
 	//
 	//   Layer 2. sub_52DED0 worker face-load chokepoint mutex — wraps the
 	//      worker chain (BSTaskThread_Runnable -> sub_523220 -> sub_9F88B0 ->
@@ -40,9 +49,14 @@ namespace EngineRaceFix
 	//      Primary defense; fires ~2500 times per session in mounted-patrol
 	//      streams.
 	//
-	// Removed in v515 strip-test (no regression observed): LFM bucket-array
-	// NOPs at 0x43296E and 0x4327EC, per-FGP g_FGPLocks lock-map.
+	// Removed in v515 strip-test (no regression observed): per-FGP g_FGPLocks
+	// lock-map (still confirmed redundant; Fix 8's in-place mutation makes the
+	// lock unnecessary for the common case).
 	// =============================================================================
+
+	// LFM bucket-array FormHeapFree NOPs (Layer 1).
+	_DefineNopHdlr(BucketArrayFreeChainA, 0x0043296E, 5);
+	_DefineNopHdlr(BucketArrayFreeChainB, 0x004327EC, 5);
 
 	// sub_52DED0 worker face-load chokepoint mutex.
 	typedef void(__thiscall* fn_sub_52DED0)(void* self, void* a1, void* a2, void* a3, void* a4, void* a5);
@@ -95,6 +109,11 @@ namespace EngineRaceFix
 	{
 		if (s_installed) return true;
 
+		// Layer 1: LFM NOPs.
+		_MemHdlr(BucketArrayFreeChainA).WriteNop();
+		_MemHdlr(BucketArrayFreeChainB).WriteNop();
+		_MESSAGE("[RBRN] EngineRaceFix: LFM bucket-array FormHeapFree NOPs applied (0x0043296E + 0x004327EC)");
+
 		// Layer 3: AgeMorphTable validation-failure redirect (0x006EDDD4 -> 0x006EDD8F).
 		WriteRelJump(0x006EDDD4, 0x006EDD8F);
 		_MESSAGE("[RBRN] EngineRaceFix: AgeMorphTable validation-failure redirect installed (0x006EDDD4 -> 0x006EDD8F)");
@@ -128,7 +147,7 @@ namespace EngineRaceFix
 		}
 
 		s_installed = true;
-		_MESSAGE("[RBRN] EngineRaceFix: stack ready (sub_52DED0 mutex + AgeMorphTable redirect + DoSomething FGP validator)");
+		_MESSAGE("[RBRN] EngineRaceFix: stack ready (LFM NOPs + sub_52DED0 mutex + AgeMorphTable redirect + DoSomething FGP validator)");
 		return true;
 	}
 

@@ -1,9 +1,16 @@
 #pragma once
 
 // =====================================================================================
-// [RBRN] Engine race fix — surviving stack after 2026-05-04 strip + relayer.
+// [RBRN] Engine race fix — four-layer stack (post-2026-05-05 re-validation).
 //
-// Three layers in this file (Fix 9 retry-loop guard lives in HeadOverride.cpp):
+// Four layers in this file (Fix 9 retry-loop guard lives in HeadOverride.cpp):
+//
+//   - LFM bucket-array FormHeapFree NOPs at 0x0043296E + 0x004327EC:
+//     closes the use-after-free window in the LockFreeMap resize routines
+//     (sub_4328B0 / sub_432740). Without this, extended play eventually
+//     crashes at sub_4328B0+0x5A. The v518 strip-test that suggested this
+//     was redundant turned out to be a too-short test; extended play in
+//     v518 reproduced the original LFM crash. Bounded leak.
 //
 //   - sub_52DED0 worker face-load chokepoint mutex: serializes the BSFaceGen
 //     worker chain (BSTaskThread_Runnable → sub_523220 → sub_9F88B0 →
@@ -19,12 +26,12 @@
 //
 //   - BSFaceGen_DoSomething FGP validator hook: validates the FGP's
 //     models.data / textures.data / third array pointers (offsets 0x78, 0x88,
-//     0x98) at function entry; bails cleanly if any are null. Originally
-//     thought to be the headline fix; in v513-v515 testing has not been
-//     observed firing, so functioning as a safety net for the corrupt-FGP code
-//     path that the chokepoint mutex doesn't cover.
+//     0x98) at function entry; bails cleanly if any are null. Primary defense
+//     for the empty-NiTArray scenario from sub_52DED0 (see
+//     feedback_facegen_storm_root_cause.md).
 //
-// Removed in audit: LFM bucket-array NOPs, per-FGP lock map. See git history.
+// Removed in audit: per-FGP g_FGPLocks lock-map (Fix 8's in-place mutation
+// makes it unnecessary for the common case). See git history.
 // =====================================================================================
 
 namespace EngineRaceFix
