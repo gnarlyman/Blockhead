@@ -348,6 +348,747 @@ namespace EngineRaceFix
 		return false;
 	}
 
+	// =============================================================================
+	// [RBRN] PROBE — FUN_0043B000 entry observer (v548 diagnostic).
+	//
+	// CONTEXT: v547's sub_5221C0 probe proved TESRace+0x29C runtime data is FINE
+	// for bad actors (identical to good actors). Therefore the empty face arrays
+	// don't come from sub_552990's NULL-pair zeroing.
+	//
+	// The 2026-05-06 agent re-trace then revealed that for NPCs (formType 0x23),
+	// `ModelLoader::QueueReference` actually dispatches a `QueuedCharacter` task
+	// (vtable 0xA36DDC), NOT a QueuedHead. QueuedCharacter::Run fans out 3 sub-
+	// tasks: BODY (FUN_0043D000 reading TESNPC+0xAC), FACE (a child QueuedHead),
+	// and EQUIPMENT. The body sub-task's result lands at wrapper+0x2c. THAT is
+	// what becomes refr+0x3C — not face0/face1.
+	//
+	// FUN_0043B000 is the QueuedCharacter completion slot (vtable[14] for the
+	// non-helmet variant; QueuedCharacter/Player slot[14] = 0x43B090 calls 0x43B000
+	// first). Layout:
+	//   wrapper+0x0c = task state (6 = cancelled/done)
+	//   wrapper+0x20 = TESObjectREFR* (the bound refr)
+	//   wrapper+0x28 = QueuedHead* (face sub-task result)
+	//   wrapper+0x2c = body NiNode* (BODY sub-task result — THE critical field)
+	//
+	// FUN_0043B000 calls FUN_00441EF0(refr, ?, body, 0). Inside FUN_00441EF0:
+	//   if (param_3 == 0) param_3 = refr->vtable[0x14c]();   // poly fallback re-queue
+	//   else if (refr+0x3C == 0)  refr+0x3C := param_3       // the actual write
+	//
+	// Hypothesis: for bad actors, body sub-task fails → wrapper+0x2c == NULL →
+	// FUN_00441EF0 takes fallback re-queue → refr+0x3C stays NULL → next frame's
+	// TESCharacter::Update re-queues → infinite loop → LFM stress → UAF.
+	//
+	// This probe captures wrapper+0x2c at the moment of completion. If body is
+	// NULL for bad actors and non-NULL for good actors, the body sub-task is the
+	// real failure point and Blockhead's face-gen layer is irrelevant to refr+0x3C.
+	//
+	// __thiscall (wrapper in ECX, no stack args). Pure observer, always calls orig.
+	// =============================================================================
+	typedef void (__fastcall* fn_FUN_0043B000)(void* self, void* /*edx*/);
+	static fn_FUN_0043B000 orig_FUN_0043B000 = (fn_FUN_0043B000)0x0043B000;
+	static volatile LONG s_probe_43B000_total = 0;
+	static volatile LONG s_probe_43B000_logged = 0;
+
+	static void __fastcall hook_FUN_0043B000(void* self, void* /*edx*/)
+	{
+		LONG total = InterlockedIncrement(&s_probe_43B000_total);
+
+		if (!self || !IsValidRead(self, 0x40)) {
+			orig_FUN_0043B000(self, NULL);
+			return;
+		}
+
+		UInt32 state = *(UInt32*)((char*)self + 0x0C);
+		void* refr   = *(void**)((char*)self + 0x20);
+		void* face   = *(void**)((char*)self + 0x28);
+		void* body   = *(void**)((char*)self + 0x2C);
+
+		UInt32 refrFormID = 0;
+		UInt32 refrFlags = 0;
+		void*  refrLoaded3D = NULL;
+		UInt32 npcFormID = 0;
+		bool   isBad = false;
+
+		if (refr && IsValidRead(refr, 0x44)) {
+			refrFormID  = *(UInt32*)((char*)refr + 0x0C);
+			refrFlags   = *(UInt32*)((char*)refr + 0x08);
+			refrLoaded3D = *(void**)((char*)refr + 0x3C);
+			void* npc = *(void**)((char*)refr + 0x40);
+			if (npc && IsValidRead(npc, 0x10)) {
+				npcFormID = *(UInt32*)((char*)npc + 0x0C);
+				isBad = IsBadActor(npc);
+			}
+		}
+
+		const char* badTag = isBad ? "[BAD] " : "";
+
+		// Log: bad actors always; non-bad only if body == NULL OR first 50 calls (baseline).
+		bool shouldLog = isBad || (body == NULL) || (total <= 50);
+		if (shouldLog) {
+			LONG n = InterlockedIncrement(&s_probe_43B000_logged);
+			// Throttle within shouldLog: first 100 always; bad-actor every 50; null-body every 20
+			bool emit = (n <= 100)
+			         || (isBad && (n % 50) == 0)
+			         || (body == NULL && (n % 20) == 0);
+			if (emit) {
+				_MESSAGE("[RBRN] PROBE 43B000 #%ld %srefr=%p NPC=%08X refrFID=%08X "
+				         "body=%p face=%p loaded3D=%p flags=%08X state=%u total=%ld",
+				         n, badTag, refr, npcFormID, refrFormID,
+				         body, face, refrLoaded3D, refrFlags, state, total);
+			}
+		}
+
+		orig_FUN_0043B000(self, NULL);
+	}
+
+	// =============================================================================
+	// [RBRN] PROBE — FUN_004D7D10 entry observer (v550 diagnostic).
+	//
+	// CONTEXT: v549's FUN_0043D000 hook ACCIDENTALLY throttled the storm via probe
+	// latency (~6× slower task completion rate vs v548). User's "no crash" was a
+	// timing-accidental side effect. Underlying bug unchanged — refr 0x70106 and
+	// 0x70107 still showed body=NULL across hundreds of captures.
+	//
+	// FUN_004D7D10 is the CANONICAL refr+0x3C writer (TESObjectREFR::SetLoaded3D).
+	// Every successful body install passes through here — it's the only place that
+	// writes refr+0x3C to a non-NULL value. By hooking entry, we observe:
+	//  - Which refrs ever get refr+0x3C populated (= body load succeeded)
+	//  - Which refrs NEVER appear (= body load never produced anything)
+	//  - Sequence: when does refr+0x3C get NULL'd vs populated
+	//
+	// Signature: __thiscall(refr) with 1 stack arg (newModel).
+	// In: in_ECX = refr. param_1 = newModel (NiNode* or NULL).
+	// Body: tests refr+0x3C != newModel, decrefs old, stores new, increfs new.
+	//
+	// Throttle: log every NULL write + every write for tracked refrFIDs (0x70106,
+	// 0x70107, MOO recruit range). Sample 1/100 otherwise. Low overhead — no
+	// VirtualQuery on hot path.
+	// =============================================================================
+	typedef void (__fastcall* fn_FUN_004D7D10)(void* refr, void* /*edx*/, void* newModel);
+	static fn_FUN_004D7D10 orig_FUN_004D7D10 = (fn_FUN_004D7D10)0x004D7D10;
+	static volatile LONG s_probe_4D7D10_total = 0;
+	static volatile LONG s_probe_4D7D10_logged = 0;
+
+	static void __fastcall hook_FUN_004D7D10(void* refr, void* /*edx*/, void* newModel)
+	{
+		LONG total = InterlockedIncrement(&s_probe_4D7D10_total);
+
+		// Cheap reads — no VirtualQuery. The refr is the engine's `this` so it's
+		// guaranteed valid by the caller. Trust it.
+		UInt32 refrFID = 0;
+		void* oldModel = NULL;
+		if (refr) {
+			refrFID = *(UInt32*)((char*)refr + 0x0C);
+			oldModel = *(void**)((char*)refr + 0x3C);
+		}
+
+		// Tracked-refr list — the storming ones we care about
+		bool tracked = false;
+		switch (refrFID) {
+		case 0x00070106:
+		case 0x00070107:
+		case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+		case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+		case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+		case 0x000700CC: case 0x000700CD:
+			tracked = true;
+			break;
+		}
+
+		bool nullWrite = (newModel == NULL);
+		bool shouldLog = nullWrite || tracked || (total <= 30) || (total % 100 == 0);
+		if (shouldLog) {
+			LONG n = InterlockedIncrement(&s_probe_4D7D10_logged);
+			const char* tag = tracked ? "[TRACKED] " : (nullWrite ? "[NULL-WR] " : "");
+			_MESSAGE("[RBRN] PROBE 4D7D10 #%ld %srefrFID=%08X newModel=%p oldModel=%p total=%ld",
+			         n, tag, refrFID, newModel, oldModel, total);
+		}
+
+		orig_FUN_004D7D10(refr, NULL, newModel);
+	}
+
+	// =============================================================================
+	// [RBRN] PROBE — FUN_004E0F80 (Set3D) entry+exit observer (v554 diagnostic).
+	//
+	// CONTEXT: v553 captured 4 [TRACKED] writes in FUN_004D7D10. Body NIF DID
+	// install for storm refrs (0x70106 newModel=8601943C, 0x70107 newModel=84B85BE0)
+	// — then within 5 calls, refr+0x3C was back to NULL. The "clear" entries showed
+	// oldModel=NULL — meaning something OTHER than FUN_004D7D10 cleared refr+0x3C
+	// between install and our next observation.
+	//
+	// FUN_004E0F80 (TESObjectREFR::Set3D) at line 838 does a direct
+	// `in_ECX[0xf] = 0;` clear — bypassing the canonical writer mutex. If Set3D
+	// fires for storm refrs after their install, this is what's cycling them back
+	// to NULL → triggering re-queue → storm.
+	//
+	// Probe captures Set3D entry + exit for tracked refrs only. If we see Set3D
+	// called with refr+0x3C transitioning non-NULL→NULL for a storm refr, that's
+	// the smoking gun.
+	//
+	// Signature: __thiscall(refr) with 1 stack arg (newModel). Same as FUN_004D7D10.
+	// =============================================================================
+	typedef void (__fastcall* fn_FUN_004E0F80)(void* refr, void* /*edx*/, void* newModel);
+	static fn_FUN_004E0F80 orig_FUN_004E0F80 = (fn_FUN_004E0F80)0x004E0F80;
+	static volatile LONG s_probe_4E0F80_total = 0;
+	static volatile LONG s_probe_4E0F80_logged = 0;
+
+	// =============================================================================
+	// [RBRN] FIX v558: Block FUN_004D6BF0 (direct Detach3D clearer) for tracked refrs.
+	//
+	// CONTEXT: v557 prevented Set3D cancellation. Body NIF installed twice for storm
+	// refrs (PROBE 4D7D10 #2267-2268 newModel=non-NULL). But the storm continued
+	// (5227 SKIP fires). Something else cleared refr+0x3C between install and the
+	// next Set3D call.
+	//
+	// FUN_004D6BF0 (seg_004d0000.c:4924): direct clearer with refcount management:
+	//     *(in_ECX + 0x38) = 0x3f800000;  // float 1.0f at +0x38
+	//     if (... && refr+0x3C != NULL) {
+	//         InterlockedDecrement(*(refr+0x3C) + 1);
+	//         if (refcount == 0) (vtbl[0])(1);  // dtor
+	//         *(refr + 0x3c) = 0;  // <-- DIRECT CLEAR
+	//     }
+	//
+	// This bypasses both Set3D and FUN_004D7D10 — explains why our v557 install was
+	// undone without showing in our probes.
+	//
+	// Fix: skip for tracked refrs to preserve installed body.
+	// Risk: legitimate detaches (refr disable) won't decref the old NiNode → leak.
+	//       Tolerable for diagnostic purposes.
+	// =============================================================================
+	typedef void (__fastcall* fn_FUN_004D6BF0)(void* refr, void* /*edx*/);
+	static fn_FUN_004D6BF0 orig_FUN_004D6BF0 = (fn_FUN_004D6BF0)0x004D6BF0;
+	static volatile LONG s_4D6BF0_skip = 0;
+	static volatile LONG s_4D6BF0_total = 0;
+
+	static void __fastcall hook_FUN_004D6BF0(void* refr, void* /*edx*/)
+	{
+		LONG total = InterlockedIncrement(&s_4D6BF0_total);
+
+		UInt32 refrFID = 0;
+		bool tracked = false;
+		void* loaded3DBefore = NULL;
+		if (refr) {
+			refrFID = *(UInt32*)((char*)refr + 0x0C);
+			loaded3DBefore = *(void**)((char*)refr + 0x3C);
+			switch (refrFID) {
+			case 0x00070106:
+			case 0x00070107:
+			case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+			case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+			case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+			case 0x000700CC: case 0x000700CD:
+				tracked = true;
+				break;
+			}
+		}
+
+		if (tracked) {
+			LONG n = InterlockedIncrement(&s_4D6BF0_skip);
+			if (n <= 5 || (n % 100) == 0) {
+				_MESSAGE("[RBRN] FIX 4D6BF0 SKIP #%ld refrFID=%08X loaded3D=%p total=%ld",
+				         n, refrFID, loaded3DBefore, total);
+			}
+			return;  // Skip orig — preserve refr+0x3C
+		}
+
+		orig_FUN_004D6BF0(refr, NULL);
+	}
+
+	// =============================================================================
+	// [RBRN] FIX v556: Block Set3D(actor, NULL) when refr+0x3C is already NULL.
+	//
+	// v555 caller analysis revealed THREE engine functions calling Set3D(refr, NULL)
+	// ~470 times each for storm refrs in 2 minutes (~11/sec total):
+	//   - FUN_0060E430 (vtable wrapper, calls Set3D after vtable[0xE0] check)
+	//   - FUN_00625020 (vtable wrapper, similar pattern with vtable[0xE2])
+	//   - FUN_004D9B50 (cleanup function, calls vtable[0x54](0) = Set3D(NULL))
+	//
+	// When Set3D is called with (NULL, NULL), it goes through the entry path:
+	//     if (refr+0x3C == newModel) {
+	//         if (newModel == 0) ModelLoader_CancelPendingForRefr(refr);
+	//         goto exit;
+	//     }
+	// CancelPendingForRefr CANCELS any pending model-load tasks for the refr —
+	// killing the body sub-task BEFORE it can produce. Storm refrs get this called
+	// ~11 times/sec, so their body load NEVER completes.
+	//
+	// Fix: when called with both NULL on an actor refr (NPC/Creature), SKIP orig.
+	// The function would have been a no-op + cancel; we keep the no-op semantic
+	// (refr+0x3C unchanged) but skip the cancel. Pending body task can now run to
+	// completion → refr+0x3C populated → TESCharacter::Update stops re-queueing →
+	// storm dies naturally → no LFM UAF.
+	//
+	// Risk: legitimate cancellations (cell unload, refr disable) will leave stale
+	// pending tasks. These should self-clean via task completion or timeout.
+	// =============================================================================
+	static volatile LONG s_set3d_skip_count = 0;
+
+	static void __fastcall hook_FUN_004E0F80(void* refr, void* /*edx*/, void* newModel)
+	{
+		LONG total = InterlockedIncrement(&s_probe_4E0F80_total);
+		void* callerRet = _ReturnAddress();
+
+		UInt32 refrFID = 0;
+		void* loaded3DBefore = NULL;
+		bool tracked = false;
+		bool isActor = false;
+
+		void* actorbase = NULL;
+		char fmtype = 0;
+
+		if (refr) {
+			refrFID = *(UInt32*)((char*)refr + 0x0C);
+			loaded3DBefore = *(void**)((char*)refr + 0x3C);
+
+			// Actor check: refr+0x40 = actorbase, actorbase+0x26 = formType byte.
+			// 0x06 = NPC_, 0x03 = CREA.
+			actorbase = *(void**)((char*)refr + 0x40);
+			if (actorbase) {
+				fmtype = *(char*)((char*)actorbase + 0x26);
+				isActor = (fmtype == 0x06 || fmtype == 0x03);
+			}
+
+			switch (refrFID) {
+			case 0x00070106:
+			case 0x00070107:
+			case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+			case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+			case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+			case 0x000700CC: case 0x000700CD:
+				tracked = true;
+				break;
+			}
+		}
+
+		// THE FIX (v557 broadened): skip Set3D when it would call CancelPendingForRefr.
+		// Trigger condition: (isActor OR tracked refrFID) + both refr+0x3C and newModel NULL.
+		// v556's isActor-only check fired 0 times, suggesting refr.actorbase is NULL
+		// or has unexpected formType when Set3D is called. The tracked-refrFID fallback
+		// guarantees the fix at least covers known storm refrs.
+		bool wouldCancel = (newModel == NULL) && (loaded3DBefore == NULL);
+		if ((isActor || tracked) && wouldCancel) {
+			LONG skipN = InterlockedIncrement(&s_set3d_skip_count);
+			if (tracked || skipN <= 5 || (skipN % 1000) == 0) {
+				const char* tag = tracked ? "[TRACKED] " : "";
+				_MESSAGE("[RBRN] FIX 4E0F80 SKIP #%ld %srefrFID=%08X actorbase=%p fmtype=%02X caller=%p total=%ld",
+				         skipN, tag, refrFID, actorbase, (UInt32)(UInt8)fmtype, callerRet, total);
+			}
+			return;  // Skip orig — no cancel, no state change
+		}
+
+		orig_FUN_004E0F80(refr, NULL, newModel);
+
+		void* loaded3DAfter = NULL;
+		if (refr) loaded3DAfter = *(void**)((char*)refr + 0x3C);
+
+		// Log ONLY tracked when NOT skipped
+		if (tracked) {
+			LONG n = InterlockedIncrement(&s_probe_4E0F80_logged);
+			_MESSAGE("[RBRN] PROBE 4E0F80 #%ld [TRACKED] refrFID=%08X newModel=%p "
+			         "loaded3D BEFORE=%p AFTER=%p actorbase=%p fmtype=%02X caller=%p total=%ld",
+			         n, refrFID, newModel, loaded3DBefore, loaded3DAfter,
+			         actorbase, (UInt32)(UInt8)fmtype, callerRet, total);
+		}
+	}
+
+	// =============================================================================
+	// [RBRN] PROBE — FUN_0043DC00 entry+exit observer (v553 diagnostic).
+	//
+	// CONTEXT: v552 confirmed body NIF for storm refrs NEVER reaches FUN_0043AE10
+	// nor FUN_004D7D10. Re-reading QueuedCharacter::Run revealed FUN_0043D000 only
+	// handles animations for NPCs (p5=0 → body branch gate fails). The actual body
+	// NIF / scene-graph load path for NPCs is elsewhere — possibly inside
+	// FUN_005268D0 (called synchronously at line 11526) or via a deferred chain
+	// we haven't fully traced.
+	//
+	// QueuedCharacter::Run (FUN_0043DC00) is the master function for NPC 3D load.
+	// By hooking entry AND exit, we capture wrapper state before/after the entire
+	// task. For storm refrs we'll see:
+	//   - refr+0x3C: NULL on entry (expected — that's why it was queued)
+	//   - wrapper+0x2c (body slot): NULL on entry (initialized to 0 by ctor)
+	//   - wrapper+0x28 (face slot): may be NULL or populated
+	//   - On EXIT: any of those fields populated? If wrapper+0x2c stays NULL after
+	//     QueuedCharacter::Run completes, we know NO sub-task wrote to it.
+	//
+	// __thiscall(wrapper) with no stack args. Low risk, clean convention.
+	// =============================================================================
+	typedef void (__fastcall* fn_FUN_0043DC00)(void* wrapper, void* /*edx*/);
+	static fn_FUN_0043DC00 orig_FUN_0043DC00 = (fn_FUN_0043DC00)0x0043DC00;
+	static volatile LONG s_probe_43DC00_total = 0;
+	static volatile LONG s_probe_43DC00_logged = 0;
+
+	static void __fastcall hook_FUN_0043DC00(void* wrapper, void* /*edx*/)
+	{
+		LONG total = InterlockedIncrement(&s_probe_43DC00_total);
+
+		// Read state BEFORE orig
+		UInt32 refrFID = 0;
+		UInt32 npcFID = 0;
+		UInt32 stateBefore = 0;
+		void*  refr = NULL;
+		void*  loaded3DBefore = NULL;
+		void*  bodySlotBefore = NULL;
+		void*  faceSlotBefore = NULL;
+		bool   tracked = false;
+
+		if (wrapper) {
+			stateBefore = *(UInt32*)((char*)wrapper + 0x0C);
+			refr = *(void**)((char*)wrapper + 0x20);
+			bodySlotBefore = *(void**)((char*)wrapper + 0x2C);
+			faceSlotBefore = *(void**)((char*)wrapper + 0x28);
+
+			if (refr) {
+				refrFID = *(UInt32*)((char*)refr + 0x0C);
+				loaded3DBefore = *(void**)((char*)refr + 0x3C);
+				void* npc = *(void**)((char*)refr + 0x40);
+				if (npc) {
+					npcFID = *(UInt32*)((char*)npc + 0x0C);
+				}
+				switch (refrFID) {
+				case 0x00070106:
+				case 0x00070107:
+				case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+				case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+				case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+				case 0x000700CC: case 0x000700CD:
+					tracked = true;
+					break;
+				}
+			}
+		}
+
+		// Call orig
+		orig_FUN_0043DC00(wrapper, NULL);
+
+		// Read state AFTER orig
+		UInt32 stateAfter = 0;
+		void*  loaded3DAfter = NULL;
+		void*  bodySlotAfter = NULL;
+		void*  faceSlotAfter = NULL;
+		if (wrapper) {
+			stateAfter = *(UInt32*)((char*)wrapper + 0x0C);
+			bodySlotAfter = *(void**)((char*)wrapper + 0x2C);
+			faceSlotAfter = *(void**)((char*)wrapper + 0x28);
+			if (refr) {
+				loaded3DAfter = *(void**)((char*)refr + 0x3C);
+			}
+		}
+
+		bool shouldLog = tracked || (total <= 30) || (total % 200 == 0);
+		if (shouldLog) {
+			LONG n = InterlockedIncrement(&s_probe_43DC00_logged);
+			const char* tag = tracked ? "[TRACKED] " : "";
+			_MESSAGE("[RBRN] PROBE 43DC00 #%ld %srefrFID=%08X NPC=%08X "
+			         "BEFORE: state=%u loaded3D=%p body=%p face=%p | "
+			         "AFTER: state=%u loaded3D=%p body=%p face=%p | total=%ld",
+			         n, tag, refrFID, npcFID,
+			         stateBefore, loaded3DBefore, bodySlotBefore, faceSlotBefore,
+			         stateAfter,  loaded3DAfter,  bodySlotAfter,  faceSlotAfter,
+			         total);
+		}
+	}
+
+	// =============================================================================
+	// [RBRN] PROBE — FUN_0043AE10 entry observer (v552 diagnostic, RETIRED).
+	//
+	// CONTEXT: v551 confirmed body NIF NEVER reaches FUN_004D7D10 for storm refrs.
+	// 0 [TRACKED] writes out of 2105 total. Body load fails somewhere between
+	// FUN_0043BDA0 (enqueue) and FUN_004D7D10 (writer).
+	//
+	// FUN_0043AE10 is QueuedCharacter::vtable[13] — the immediate completion writer
+	// invoked when the LFM worker delivers a produced 3D model. It calls FUN_004D7D10
+	// internally to write refr+0x3C. If we see storm refrs reach FUN_0043AE10 but NOT
+	// FUN_004D7D10, the link in between drops the model. If we DON'T see them at
+	// FUN_0043AE10 either, the worker never produced a model for them.
+	//
+	// Signature: __thiscall(wrapper) with 1 stack arg (produced NiNode).
+	// In: ECX = QueuedCharacter*. param_1 = produced NiNode (NULL if no model).
+	// =============================================================================
+	typedef void (__fastcall* fn_FUN_0043AE10)(void* wrapper, void* /*edx*/, void* produced);
+	static fn_FUN_0043AE10 orig_FUN_0043AE10 = (fn_FUN_0043AE10)0x0043AE10;
+	static volatile LONG s_probe_43AE10_total = 0;
+	static volatile LONG s_probe_43AE10_logged = 0;
+
+	static void __fastcall hook_FUN_0043AE10(void* wrapper, void* /*edx*/, void* produced)
+	{
+		LONG total = InterlockedIncrement(&s_probe_43AE10_total);
+
+		// Read refr from wrapper+0x20
+		UInt32 refrFID = 0;
+		bool tracked = false;
+		void* refr = NULL;
+		if (wrapper) {
+			refr = *(void**)((char*)wrapper + 0x20);
+			if (refr) {
+				refrFID = *(UInt32*)((char*)refr + 0x0C);
+				switch (refrFID) {
+				case 0x00070106:
+				case 0x00070107:
+				case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+				case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+				case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+				case 0x000700CC: case 0x000700CD:
+					tracked = true;
+					break;
+				}
+			}
+		}
+
+		bool nullProduced = (produced == NULL);
+		bool shouldLog = tracked || nullProduced || (total <= 30) || (total % 200 == 0);
+		if (shouldLog) {
+			LONG n = InterlockedIncrement(&s_probe_43AE10_logged);
+			const char* tag = tracked ? "[TRACKED] " : (nullProduced ? "[NULL-PROD] " : "");
+			_MESSAGE("[RBRN] PROBE 43AE10 #%ld %srefrFID=%08X produced=%p wrapper=%p total=%ld",
+			         n, tag, refrFID, produced, wrapper, total);
+		}
+
+		orig_FUN_0043AE10(wrapper, NULL, produced);
+	}
+
+	// =============================================================================
+	// [RBRN] PROBE — FUN_0043BDA0 entry observer (v550 diagnostic, RETIRED).
+	//
+	// FUN_0043BDA0 is the body sub-task enqueue function. Called from FUN_0043D000
+	// with the constructed Queued* sub-task struct + wrapper context. If this fires
+	// for a storm refr, body load IS being attempted. If it never fires, the gating
+	// in FUN_0043D000 prevented the enqueue.
+	//
+	// Signature: __cdecl(model_struct, ?, wrapper, path_or_null) — 4 args.
+	// param_1 = body model linked-list head (or single struct)
+	// param_2 = some context value
+	// param_3 = the QueuedCharacter wrapper (we read refr from wrapper+0x20)
+	// param_4 = optional path string (NULL for skeleton, "Data..." for SpecialAnims)
+	// =============================================================================
+	typedef void (__cdecl* fn_FUN_0043BDA0)(void* param_1, void* param_2, void* param_3, void* param_4);
+	static fn_FUN_0043BDA0 orig_FUN_0043BDA0 = (fn_FUN_0043BDA0)0x0043BDA0;
+	static volatile LONG s_probe_43BDA0_total = 0;
+	static volatile LONG s_probe_43BDA0_logged = 0;
+
+	static void __cdecl hook_FUN_0043BDA0(void* param_1, void* param_2, void* param_3, void* param_4)
+	{
+		LONG total = InterlockedIncrement(&s_probe_43BDA0_total);
+
+		// Read refr from wrapper+0x20 (param_3 = wrapper)
+		UInt32 refrFID = 0;
+		bool tracked = false;
+		void* refr = NULL;
+		if (param_3) {
+			refr = *(void**)((char*)param_3 + 0x20);
+			if (refr) {
+				refrFID = *(UInt32*)((char*)refr + 0x0C);
+				switch (refrFID) {
+				case 0x00070106:
+				case 0x00070107:
+				case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+				case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+				case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+				case 0x000700CC: case 0x000700CD:
+					tracked = true;
+					break;
+				}
+			}
+		}
+
+		bool hasPath = (param_4 != NULL);
+		bool shouldLog = tracked || (total <= 30) || (total % 200 == 0);
+		if (shouldLog) {
+			LONG n = InterlockedIncrement(&s_probe_43BDA0_logged);
+			const char* tag = tracked ? "[TRACKED] " : "";
+			const char* pathTag = hasPath ? "[ANIM]" : "[BODY]";
+			_MESSAGE("[RBRN] PROBE 43BDA0 #%ld %s%s refrFID=%08X model=%p ctx=%p wrapper=%p total=%ld",
+			         n, tag, pathTag, refrFID, param_1, param_2, param_3, total);
+		}
+
+		orig_FUN_0043BDA0(param_1, param_2, param_3, param_4);
+	}
+
+	// Old probes retained as code but NOT attached in v550 (see Install() below):
+	//   - hook_FUN_0043B000 (v548): retained for reference; NOT attached in v550.
+	//     The body=NULL signal is now derivable from "refrFID never appears in
+	//     PROBE 4D7D10 with newModel != NULL" + the storm rate.
+	//   - hook_FUN_0043D000 (v549): RETIRED. It threw the timing accidentally.
+	//   - hook_sub_5221C0 (v547): retained but not attached. Data was conclusive.
+
+	// ORIGINAL v548/v549 probes below — keep code but not attached.
+	// =============================================================================
+	// [RBRN] PROBE — FUN_0043B000 entry observer (v548 diagnostic, NOT ATTACHED in v550).
+	//
+	// CONTEXT: v548's FUN_0043B000 probe confirmed the body sub-task fails to
+	// produce for storm-trigger refrs. wrapper+0x2c stays NULL while wrapper+0x28
+	// (face) populates correctly. ~5000 task completions per minute in DerelictMine
+	// scene; ~3% have body=NULL at completion, including the storm refr 0x70107.
+	//
+	// FUN_0043D000 is the body-NIF dispatch function. It reads TESActorBase+0xAC
+	// (the model path field), checks if path ends in "Skeleton", and conditionally
+	// calls FUN_0043bda0 to enqueue the body sub-task. If the gating logic doesn't
+	// call FUN_0043bda0 for our bad NPCs, body sub-task is never enqueued →
+	// wrapper+0x2c stays at its ctor-zero state.
+	//
+	// Function signature (Ghidra): FUN_0043d000(int* param_1, undefined4 param_2,
+	//   undefined4 param_3, int* param_4, char param_5, char param_6)
+	// param_1 = TESActorBase pointer (or 0); model path read via vtable[0x05]
+	// param_3 = wrapper (the QueuedCharacter)
+	// param_4 = refr (TESObjectREFR*)
+	// Calling convention: thiscall via ECX (something else); args on stack.
+	//
+	// Internal gates (from seg_00430000.c:10977-10987):
+	//   (param_4 == NULL || vtable[0x66](0) == 0)
+	//   AND ( (cVar1 == '\0' AND path_basename starts with "Skeleton") OR param_6 != 0 )
+	//   AND param_5 != 0
+	// → calls FUN_00435830(path, 1) + FUN_0043bda0(uVar5, ...)
+	//
+	// The probe captures: refr formID, NPC formID, the model path string, param_5/6,
+	// and whether the strncmp("Skeleton",8)==0 succeeds.
+	//
+	// __thiscall (in_ECX = wrapper); explicit args pushed.
+	// =============================================================================
+	typedef void (__fastcall* fn_FUN_0043D000)(void* in_ECX, void* /*edx*/,
+	                                           void* param_1, void* param_2, void* param_3,
+	                                           void* param_4, char param_5, char param_6);
+	static fn_FUN_0043D000 orig_FUN_0043D000 = (fn_FUN_0043D000)0x0043D000;
+	static volatile LONG s_probe_43D000_total = 0;
+	static volatile LONG s_probe_43D000_logged = 0;
+
+	static void __fastcall hook_FUN_0043D000(void* in_ECX, void* /*edx*/,
+	                                         void* param_1, void* param_2, void* param_3,
+	                                         void* param_4, char param_5, char param_6)
+	{
+		LONG total = InterlockedIncrement(&s_probe_43D000_total);
+
+		// Capture identifying info
+		UInt32 refrFID = 0;
+		UInt32 npcFID = 0;
+		bool isBad = false;
+		void* refr = param_4;
+		if (refr && IsValidRead(refr, 0x44)) {
+			refrFID = *(UInt32*)((char*)refr + 0x0C);
+			void* npc = *(void**)((char*)refr + 0x40);
+			if (npc && IsValidRead(npc, 0x10)) {
+				npcFID = *(UInt32*)((char*)npc + 0x0C);
+				isBad = IsBadActor(npc);
+			}
+		}
+
+		// Read the model path. param_1 is supposed to be TESActorBase+0xAC area.
+		// Engine reads via vtable[0x05] — for safety, we just dump the first 60 chars
+		// of whatever string param_1 points to (treating it as a const char*).
+		// Actually safer: param_1 is the TESActorBase pointer with +0xAC offset already
+		// applied. So *(char**)param_1 is the model path string ptr (TESModel pattern).
+		char pathBuf[64] = {0};
+		bool pathValid = false;
+		if (param_1 && IsValidRead(param_1, 4)) {
+			char* pathPtr = *(char**)param_1;
+			if (pathPtr && IsValidRead(pathPtr, 1)) {
+				pathValid = true;
+				for (int i = 0; i < 63; i++) {
+					if (!IsValidRead(pathPtr + i, 1)) break;
+					pathBuf[i] = pathPtr[i];
+					if (pathBuf[i] == 0) break;
+				}
+				pathBuf[63] = 0;
+			}
+		}
+
+		// Throttle: bad-actors always; first 30 calls; every 100th otherwise; null/empty path entries
+		bool emptyPath = !pathValid || pathBuf[0] == 0;
+		bool shouldLog = isBad || (total <= 30) || emptyPath || (total % 100) == 0;
+		if (shouldLog) {
+			LONG n = InterlockedIncrement(&s_probe_43D000_logged);
+			const char* badTag = isBad ? "[BAD] " : "";
+			const char* emptyTag = emptyPath ? "[EMPTY-PATH] " : "";
+			_MESSAGE("[RBRN] PROBE 43D000 #%ld %s%srefr=%p refrFID=%08X NPC=%08X "
+			         "p1=%p p4=%p p5=%d p6=%d path=\"%s\" total=%ld",
+			         n, badTag, emptyTag, refr, refrFID, npcFID,
+			         param_1, param_4, (int)param_5, (int)param_6,
+			         pathBuf, total);
+		}
+
+		orig_FUN_0043D000(in_ECX, NULL, param_1, param_2, param_3, param_4, param_5, param_6);
+	}
+
+	// Old v547 probe (sub_5221C0) removed — TESRace+0x29C runtime data was empirically
+	// proven identical for bad and good actors. The bug is downstream of sub_552990,
+	// in the BODY sub-task path probed via FUN_0043B000 (v548) and FUN_0043D000 (v549).
+	typedef void (__thiscall* fn_sub_5221C0)(void* self, void* param_1);
+	static fn_sub_5221C0 orig_sub_5221C0 = (fn_sub_5221C0)0x005221C0;
+	static volatile LONG s_probe_5221C0_total = 0;
+	static volatile LONG s_probe_5221C0_nullslot = 0;
+	static volatile LONG s_probe_5221C0_norace = 0;
+
+	static void __fastcall hook_sub_5221C0(void* self, void* /*edx*/, void* param_1)
+	{
+		LONG total = InterlockedIncrement(&s_probe_5221C0_total);
+
+		if (!self || !IsValidRead(self, 0xEC)) {
+			orig_sub_5221C0(self, param_1);
+			return;
+		}
+
+		UInt32 npcFormID = *(UInt32*)((char*)self + 0xC);
+		void* race = *(void**)((char*)self + 0xE8);
+
+		bool isBad = IsBadActor(self);
+		const char* badTag = isBad ? "[BAD] " : "";
+
+		if (!race) {
+			LONG n = InterlockedIncrement(&s_probe_5221C0_norace);
+			if (n <= 20 || (n % 200) == 0) {
+				_MESSAGE("[RBRN] PROBE 5221C0 #%ld %sNPC=%08X race=NULL (fallback path) total=%ld",
+				         n, badTag, npcFormID, total);
+			}
+			orig_sub_5221C0(self, param_1);
+			return;
+		}
+
+		if (!IsValidRead(race, 0x300)) {
+			orig_sub_5221C0(self, param_1);
+			return;
+		}
+
+		UInt32 raceFormID = *(UInt32*)((char*)race + 0xC);
+		const char* grid = (const char*)race + 0x29C;
+
+		// 4 entries × 0x18 = 0x60 bytes total at TESRace+0x29C
+		// FaceGenDataScanner finding: slots 0-2 always valid, slot 3 always v0=v4=0
+		// We log slots 0-2 NULL events as the actionable signal; slot 3 is suppressed
+		// since it's the engine's "padding/unused" slot.
+		bool anyNull = false;
+		UInt32 slotV0[4] = {0,0,0,0};
+		UInt32 slotV4[4] = {0,0,0,0};
+		for (int i = 0; i < 4; i++) {
+			slotV0[i] = *(UInt32*)(grid + i*0x18 + 0);
+			slotV4[i] = *(UInt32*)(grid + i*0x18 + 4);
+			if (i < 3 && (slotV0[i] == 0 || slotV4[i] == 0)) {
+				anyNull = true;
+			}
+		}
+
+		// Always log first 5 calls (warm-up baseline) regardless of bad-actor status.
+		bool logBaseline = (total <= 5);
+
+		if (anyNull || logBaseline || isBad) {
+			LONG n = anyNull ? InterlockedIncrement(&s_probe_5221C0_nullslot) : 0;
+			const char* tag = anyNull ? "NULLPAIR" : (isBad ? "bad-baseline" : "baseline");
+			// Throttle: log first 30 of each category, then every 100th
+			bool shouldLog = anyNull
+				? (n <= 30 || (n % 100) == 0)
+				: (total <= 30 || (isBad && (total % 50) == 0));
+			if (shouldLog) {
+				_MESSAGE("[RBRN] PROBE 5221C0 #%ld %sNPC=%08X race=%08X %s "
+				         "s0=(%08X,%08X) s1=(%08X,%08X) s2=(%08X,%08X) s3=(%08X,%08X) total=%ld",
+				         n, badTag, npcFormID, raceFormID, tag,
+				         slotV0[0], slotV4[0],
+				         slotV0[1], slotV4[1],
+				         slotV0[2], slotV4[2],
+				         slotV0[3], slotV4[3],
+				         total);
+			}
+		}
+
+		orig_sub_5221C0(self, param_1);
+	}
+
 	static void __fastcall hook_sub_52DED0(void* self, void* /*edx*/,
 	                                       void* a1, void* a2, void* a3, void* a4, void* a5)
 	{
@@ -547,6 +1288,12 @@ namespace EngineRaceFix
 		err |= DetourAttach(&(PVOID&)orig_sub_528D90,  hook_sub_528D90);
 		err |= DetourAttach(&(PVOID&)orig_sub_4348B0,  hook_sub_4348B0);
 		err |= DetourAttach(&(PVOID&)orig_DoSomething, hook_DoSomething);
+		// v547 (sub_5221C0), v548 (FUN_0043B000), v549 (FUN_0043D000) probes RETIRED.
+		// v549's FUN_0043D000 hook accidentally throttled the storm via probe latency.
+		// v550 probes target the canonical refr+0x3C writer + body sub-task enqueue.
+		err |= DetourAttach(&(PVOID&)orig_FUN_004D7D10, hook_FUN_004D7D10);  // [RBRN] v550 probe — canonical refr+0x3C writer
+		err |= DetourAttach(&(PVOID&)orig_FUN_004E0F80, hook_FUN_004E0F80);  // [RBRN] v554/557 probe + FIX — Set3D
+		err |= DetourAttach(&(PVOID&)orig_FUN_004D6BF0, hook_FUN_004D6BF0);  // [RBRN] v558 FIX — direct Detach3D clearer
 
 		if (err != NO_ERROR) {
 			_ERROR("[RBRN] EngineRaceFix: DetourAttach failed (%ld)", err);
@@ -579,6 +1326,9 @@ namespace EngineRaceFix
 		DetourDetach(&(PVOID&)orig_sub_528D90,  hook_sub_528D90);
 		DetourDetach(&(PVOID&)orig_sub_4348B0,  hook_sub_4348B0);
 		DetourDetach(&(PVOID&)orig_DoSomething, hook_DoSomething);
+		DetourDetach(&(PVOID&)orig_FUN_004D7D10, hook_FUN_004D7D10);  // [RBRN] v550 probe
+		DetourDetach(&(PVOID&)orig_FUN_004E0F80, hook_FUN_004E0F80);  // [RBRN] v554/557
+		DetourDetach(&(PVOID&)orig_FUN_004D6BF0, hook_FUN_004D6BF0);  // [RBRN] v558
 		DetourTransactionCommit();
 		DeleteCriticalSection(&s_facegenLock);
 
