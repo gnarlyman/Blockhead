@@ -85,6 +85,15 @@ namespace EngineRaceFix
 	extern const UInt32 kBadActorLocalFormIDs[];
 	extern const UInt32 kBadActorCount;
 
+	// v560: bypass the bad-actor blacklist short-circuits at all 4 hook sites.
+	// The blacklist (Layer 6, v541) was a FaceGen-give-up workaround for the LFM
+	// cancellation crash; v557+v558 fix that crash at the actual race site, so the
+	// give-up workaround now only HIDES faces that would otherwise load fine
+	// (Layers 1-5: LFM NOPs, sub_52DED0 mutex, AgeMorphTable redirect, DoSomething
+	// FGP validator, sub_5547F0 eye-validity patches still cover the FaceGen-side
+	// safety). Set false to restore v558 behavior.
+	static const bool kBypassBadActorLogic = true;
+
 	// =============================================================================
 	// [RBRN] v541 — BSFaceGenNiNode sentinel for storm-stop.
 	//
@@ -165,7 +174,7 @@ namespace EngineRaceFix
 	// our sentinel survives between QueuedHead::Run calls.
 	static void __fastcall hook_sub_522260(void* self, void* /*edx*/)
 	{
-		if (IsBadActor(self)) {
+		if (!kBypassBadActorLogic && IsBadActor(self)) {
 			LONG n = InterlockedIncrement(&s_releaseSkipCount);
 			if (n <= 5 || (n % 100) == 0) {
 				_MESSAGE("[RBRN] sub_522260 release skip #%ld for bad actor", n);
@@ -180,7 +189,7 @@ namespace EngineRaceFix
 	// no sub_435300 → no sub_52DED0 → no allocation churn.
 	static void __fastcall hook_sub_528D90(void* self, void* /*edx*/)
 	{
-		if (IsBadActor(self)) {
+		if (!kBypassBadActorLogic && IsBadActor(self)) {
 			LONG n = InterlockedIncrement(&s_528D90SkipCount);
 			if (n <= 5 || (n % 100) == 0) {
 				_MESSAGE("[RBRN] sub_528D90 skip #%ld for bad actor", n);
@@ -238,6 +247,7 @@ namespace EngineRaceFix
 		UInt32 local = refID & 0x00FFFFFF;
 		for (UInt32 i = 0; i < kBadActorCount; i++) {
 			if (local == kBadActorLocalFormIDs[i]) {
+				if (kBypassBadActorLogic) break;  // v560: let it enqueue normally
 				LONG n = InterlockedIncrement(&s_4348B0SkipCount);
 				if (n <= 5 || (n % 100) == 0) {
 					_MESSAGE("[RBRN] sub_4348B0 enqueue skip #%ld for bad actor (formID=%08X)",
@@ -264,7 +274,7 @@ namespace EngineRaceFix
 			npc = *(void**)((char*)self + 0x20);
 		} __except(EXCEPTION_EXECUTE_HANDLER) {}
 
-		if (!IsBadActor(npc)) {
+		if (kBypassBadActorLogic || !IsBadActor(npc)) {
 			orig_sub_435300(self);
 			return;
 		}
@@ -660,13 +670,14 @@ namespace EngineRaceFix
 			}
 		}
 
-		// THE FIX (v557 broadened): skip Set3D when it would call CancelPendingForRefr.
-		// Trigger condition: (isActor OR tracked refrFID) + both refr+0x3C and newModel NULL.
-		// v556's isActor-only check fired 0 times, suggesting refr.actorbase is NULL
-		// or has unexpected formType when Set3D is called. The tracked-refrFID fallback
-		// guarantees the fix at least covers known storm refrs.
+		// THE FIX (v562 narrowed): skip Set3D when it would call CancelPendingForRefr,
+		// but ONLY for the 16 known storm refrs (tracked list). v557's broader
+		// (isActor || tracked) check broke face-load on legitimate non-tracked
+		// actors because their normal Set3D-NULL→install cycle was being suppressed.
+		// Tracked-only keeps the crash-suppression on storm refrs while letting
+		// every other actor go through the engine's normal lifecycle.
 		bool wouldCancel = (newModel == NULL) && (loaded3DBefore == NULL);
-		if ((isActor || tracked) && wouldCancel) {
+		if (tracked && wouldCancel) {
 			LONG skipN = InterlockedIncrement(&s_set3d_skip_count);
 			if (tracked || skipN <= 5 || (skipN % 1000) == 0) {
 				const char* tag = tracked ? "[TRACKED] " : "";
@@ -1092,10 +1103,11 @@ namespace EngineRaceFix
 	static void __fastcall hook_sub_52DED0(void* self, void* /*edx*/,
 	                                       void* a1, void* a2, void* a3, void* a4, void* a5)
 	{
-		// Skip known bad actors: empty B1/B2 produces a DoSomething AV which Layer 4
-		// catches but the retry storm exhausts the LFM hazard-pointer protocol → UAF.
-		// Skipping here eliminates the trigger entirely (no allocation, no churn).
-		if (IsBadActor(a3)) {
+		// v562: skip for bad actors gated by kBypassBadActorLogic. The "skip → produce
+		// empty B1/B2" path was the FaceGen-give-up workaround for the retry storm.
+		// With v557 fixing the cancellation race upstream, the storm doesn't happen,
+		// so let FaceGen run normally — that's what produces the face data we want.
+		if (!kBypassBadActorLogic && IsBadActor(a3)) {
 			LONG n = InterlockedIncrement(&s_moonpcSkipCount);
 			if (n <= 5 || (n % 100) == 0) {
 				_MESSAGE("[RBRN] sub_52DED0 skip #%ld: bad actor (TESNPC=%p formID=%08X)",
@@ -1247,31 +1259,421 @@ namespace EngineRaceFix
 		orig_DoSomething(faceGenNode, faceGenParams);
 	}
 
+	// =============================================================================
+	// [RBRN] v559 PROBES — trace upstream of the Set3D-NULL storm.
+	//
+	// CONTEXT: v558 stopped the LFM crash but body 3D never installs for storm refrs
+	// (VirtueRider 0x70106 + horse 0x70107). Decomp tracing identified
+	// TESCharacter::Update line 200 (FUN_004E0580+0x80) as the storm source:
+	//
+	//     if ((cellUpdateFlag) && (param_1 & 0x40000000)) {
+	//         if ((flags >> 0xB & 1) == 0 && (flags >> 5 & 1) == 0) {
+	//             ModelLoader_QueueReference(refr, ...)   // queue body load
+	//         } else {
+	//             vtable[0x54](0)   // Set3D(NULL) per frame — STORM
+	//         }
+	//     }
+	//
+	// Bit 5 (0x20) and bit 11 (0x800) are runtime "tear down 3D" state flags.
+	// The patrol refrs ship with ESM flag 0x400 only (Initially Disabled / Persistent);
+	// no plugin overrides them. So bits 5 & 11 are SET AT RUNTIME by something we
+	// have not yet traced. Three observers answer the remaining questions:
+	//
+	//   438060 (ModelLoader::QueueReference)   — who is queuing body loads on
+	//                                            disabled-state refrs (the actual race
+	//                                            substrate)?
+	//   46A9E0 (set/clear bit 5 on +0x08)      — who toggles the "disabled" bit, and
+	//                                            does it stick or oscillate?
+	//   46ABA0 (set/clear bit 11 on +0x08)     — same question for the VWD-shaped bit.
+	//
+	// All three are PURE PROBES — they call orig() unmodified. They only capture
+	// _ReturnAddress() and tracked-FID flag state. Risk: log volume; mitigated by
+	// per-tracked sampling (first 20 + every Nth) and tracked-only filter.
+	// =============================================================================
+
+	// --- 438060 ModelLoader::QueueReference ---------------------------------------
+	// Signature (per Ghidra seg_00430000.c:6802): __thiscall on ModelLoader singleton,
+	// 2 stack args (refr*, formType). Use __fastcall typedef with /*edx*/ slot to
+	// absorb the unused EDX register and dispatch to __thiscall via Detours.
+	typedef void (__fastcall* fn_ModelLoader_QueueReference)(void* modelLoader, void* /*edx*/, void* refr, UInt32 formType);
+	static fn_ModelLoader_QueueReference orig_ModelLoader_QueueReference = (fn_ModelLoader_QueueReference)0x00438060;
+	static volatile LONG s_probe_438060_total = 0;
+	static volatile LONG s_probe_438060_logged = 0;
+
+	static void __fastcall hook_ModelLoader_QueueReference(void* modelLoader, void* /*edx*/, void* refr, UInt32 formType)
+	{
+		LONG total = InterlockedIncrement(&s_probe_438060_total);
+		void* callerRet = _ReturnAddress();
+
+		UInt32 refrFID = 0;
+		UInt32 refrFlags = 0;
+		void* loaded3D = NULL;
+		bool tracked = false;
+
+		if (refr) {
+			refrFID    = *(UInt32*)((char*)refr + 0x0C);
+			refrFlags  = *(UInt32*)((char*)refr + 0x08);
+			loaded3D   = *(void**)((char*)refr + 0x3C);
+			switch (refrFID) {
+			case 0x00070106: case 0x00070107:
+			case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+			case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+			case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+			case 0x000700CC: case 0x000700CD:
+				tracked = true;
+				break;
+			}
+		}
+
+		if (tracked) {
+			LONG n = InterlockedIncrement(&s_probe_438060_logged);
+			if (n <= 20 || (n % 50) == 0) {
+				_MESSAGE("[RBRN] PROBE 438060 #%ld [TRACKED] refrFID=%08X flags=%08X (bit5=%lu bit11=%lu) loaded3D=%p formType=%u caller=%p total=%ld",
+				         n, refrFID, refrFlags,
+				         (unsigned long)((refrFlags >> 5) & 1), (unsigned long)((refrFlags >> 11) & 1),
+				         loaded3D, formType, callerRet, total);
+			}
+		}
+
+		orig_ModelLoader_QueueReference(modelLoader, NULL, refr, formType);
+	}
+
+	// --- 46A9E0  set/clear bit 5 (0x20) on this+0x08 -----------------------------
+	// Signature (per Ghidra seg_00460000.c:8056): __thiscall, 1 stack arg (char param).
+	// Body: if param==0 clear bit 5, else set bit 5; then dispatch vtable[0x10] propagator.
+	typedef void (__fastcall* fn_FUN_0046A9E0)(void* self, void* /*edx*/, char param);
+	static fn_FUN_0046A9E0 orig_FUN_0046A9E0 = (fn_FUN_0046A9E0)0x0046A9E0;
+	static volatile LONG s_probe_46A9E0_total = 0;
+	static volatile LONG s_probe_46A9E0_logged = 0;
+
+	static void __fastcall hook_FUN_0046A9E0(void* self, void* /*edx*/, char param)
+	{
+		LONG total = InterlockedIncrement(&s_probe_46A9E0_total);
+		void* callerRet = _ReturnAddress();
+
+		UInt32 fid = 0;
+		UInt32 flagsBefore = 0;
+		bool tracked = false;
+
+		if (self) {
+			fid         = *(UInt32*)((char*)self + 0x0C);
+			flagsBefore = *(UInt32*)((char*)self + 0x08);
+			switch (fid) {
+			case 0x00070106: case 0x00070107:
+			case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+			case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+			case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+			case 0x000700CC: case 0x000700CD:
+				tracked = true;
+				break;
+			}
+		}
+
+		if (tracked) {
+			LONG n = InterlockedIncrement(&s_probe_46A9E0_logged);
+			if (n <= 20 || (n % 200) == 0) {
+				_MESSAGE("[RBRN] PROBE 46A9E0 #%ld [TRACKED] fid=%08X flagsBefore=%08X bit5Before=%lu param=%d willSetBit5=%d caller=%p total=%ld",
+				         n, fid, flagsBefore,
+				         (unsigned long)((flagsBefore >> 5) & 1),
+				         (int)param, (param != 0) ? 1 : 0,
+				         callerRet, total);
+			}
+		}
+
+		orig_FUN_0046A9E0(self, NULL, param);
+	}
+
+	// --- 46ABA0  set/clear bit 11 (0x800) on this+0x08 ---------------------------
+	// Signature (per Ghidra seg_00460000.c:8162): same shape as FUN_0046A9E0.
+	typedef void (__fastcall* fn_FUN_0046ABA0)(void* self, void* /*edx*/, char param);
+	static fn_FUN_0046ABA0 orig_FUN_0046ABA0 = (fn_FUN_0046ABA0)0x0046ABA0;
+	static volatile LONG s_probe_46ABA0_total = 0;
+	static volatile LONG s_probe_46ABA0_logged = 0;
+
+	static void __fastcall hook_FUN_0046ABA0(void* self, void* /*edx*/, char param)
+	{
+		LONG total = InterlockedIncrement(&s_probe_46ABA0_total);
+		void* callerRet = _ReturnAddress();
+
+		UInt32 fid = 0;
+		UInt32 flagsBefore = 0;
+		bool tracked = false;
+
+		if (self) {
+			fid         = *(UInt32*)((char*)self + 0x0C);
+			flagsBefore = *(UInt32*)((char*)self + 0x08);
+			switch (fid) {
+			case 0x00070106: case 0x00070107:
+			case 0x000700C0: case 0x000700C1: case 0x000700C2: case 0x000700C3:
+			case 0x000700C4: case 0x000700C5: case 0x000700C6: case 0x000700C7:
+			case 0x000700C8: case 0x000700C9: case 0x000700CA: case 0x000700CB:
+			case 0x000700CC: case 0x000700CD:
+				tracked = true;
+				break;
+			}
+		}
+
+		if (tracked) {
+			LONG n = InterlockedIncrement(&s_probe_46ABA0_logged);
+			if (n <= 20 || (n % 200) == 0) {
+				_MESSAGE("[RBRN] PROBE 46ABA0 #%ld [TRACKED] fid=%08X flagsBefore=%08X bit11Before=%lu param=%d willSetBit11=%d caller=%p total=%ld",
+				         n, fid, flagsBefore,
+				         (unsigned long)((flagsBefore >> 11) & 1),
+				         (int)param, (param != 0) ? 1 : 0,
+				         callerRet, total);
+			}
+		}
+
+		orig_FUN_0046ABA0(self, NULL, param);
+	}
+
+	// =============================================================================
+	// [V565] INSTRUMENTATION — capture helper.eyeLeft (FGP+0xB8) progression
+	// through the FaceGen pipeline to identify the corruption window.
+	//
+	// Pipeline (per reference_facegen_call_chain.md + decompile of these fns):
+	//   sub_52CD50(race, npc, helper)       writes helper+0xB8 = race+0x188 (canon)
+	//   sub_555A80(out1, out2, helper, fl)  reads helper+0xB8; if non-zero & non-zero
+	//                                        eyeRight, calls sub_5547F0
+	//   sub_5547F0(out1, out2, helper, fl)  derefs helper+0xB8 → AV when corrupt
+	//                                        (vtable[5] call at sub_5547F0+0xB6)
+	//
+	// We hook all 3 and snapshot helper+0xB8 at each. Logs interleave so we can see
+	// where the value changes:
+	//   - Same canon at all 3 → corruption inside sub_5547F0 itself
+	//   - Differs between 52CD50 EXIT and 555A80 ENTRY → corruption in between
+	//   - Differs between 555A80 ENTRY and 5547F0 ENTRY → corruption inside 555A80
+	//
+	// Filter: only log when NPC is in IsBadActor blacklist.
+	// Helper-address → NPC mapping via small CS-protected ring buffer (NO TLS).
+	// Pointer reads validated via VirtualQuery (IsValidRead).
+	// =============================================================================
+
+	typedef void (__fastcall* fn_sub_52CD50)(void* race, void* /*edx*/, void* npc, void* helper);
+	static fn_sub_52CD50 orig_sub_52CD50 = (fn_sub_52CD50)0x0052CD50;
+
+	typedef void (__cdecl* fn_sub_555A80)(void* out1, void* out2, void* helper, char flag);
+	static fn_sub_555A80 orig_sub_555A80 = (fn_sub_555A80)0x00555A80;
+
+	typedef void (__cdecl* fn_sub_5547F0)(void* out1, void* out2, void* helper, char flag);
+	static fn_sub_5547F0 orig_sub_5547F0 = (fn_sub_5547F0)0x005547F0;
+
+	// v567 — confirm whether sub_52DED0 (the worker-chain chokepoint) is ever invoked.
+	// If it never fires, the crash isn't in that chain — it's downstream of Blockhead's
+	// SwapFaceGenHeadData on the synchronous TESRace::GetFaceGenHeadParameters path.
+	typedef void (__fastcall* fn_v567_sub_52DED0)(void* race, void* /*edx*/, void* a1, void* a2, void* npc, void* a4, void* a5);
+	static fn_v567_sub_52DED0 orig_v567_sub_52DED0 = (fn_v567_sub_52DED0)0x0052DED0;
+	static volatile LONG s_v567_log_52DED0 = 0;
+
+	struct V565Context {
+		void*  helper;
+		UInt32 npcFID;
+		UInt32 raceFID;
+		UInt32 expectedEyeLeft;   // what sub_52CD50 set it to (race+0x188)
+		UInt32 expectedEyeRight;  // race+0x1A0
+		DWORD  threadId;
+	};
+	static V565Context  s_v567_ctx[16];
+	static CRITICAL_SECTION s_v567_lock;
+	static bool         s_v567_lockInit = false;
+	static volatile LONG s_v567_ctxIdx = 0;
+	static volatile LONG s_v567_log_52CD50 = 0;
+	static volatile LONG s_v567_log_555A80 = 0;
+	static volatile LONG s_v567_log_5547F0 = 0;
+
+	static void V565RecordContext(void* helper, UInt32 npcFID, UInt32 raceFID,
+	                              UInt32 expL, UInt32 expR)
+	{
+		LONG idx = InterlockedIncrement(&s_v567_ctxIdx) % 16;
+		EnterCriticalSection(&s_v567_lock);
+		s_v567_ctx[idx].helper = helper;
+		s_v567_ctx[idx].npcFID = npcFID;
+		s_v567_ctx[idx].raceFID = raceFID;
+		s_v567_ctx[idx].expectedEyeLeft = expL;
+		s_v567_ctx[idx].expectedEyeRight = expR;
+		s_v567_ctx[idx].threadId = GetCurrentThreadId();
+		LeaveCriticalSection(&s_v567_lock);
+	}
+
+	// Lookup most-recent context for a helper (scan all entries, return latest match).
+	// Returns true if found.
+	static bool V565LookupContext(void* helper, V565Context* out)
+	{
+		EnterCriticalSection(&s_v567_lock);
+		bool found = false;
+		// Scan in reverse from most-recent; tie-break on threadId.
+		DWORD tid = GetCurrentThreadId();
+		// First pass: same-thread match
+		for (int i = 0; i < 16; i++) {
+			if (s_v567_ctx[i].helper == helper && s_v567_ctx[i].threadId == tid) {
+				if (out) *out = s_v567_ctx[i];
+				found = true;
+				break;
+			}
+		}
+		// Second pass: any-thread match
+		if (!found) {
+			for (int i = 0; i < 16; i++) {
+				if (s_v567_ctx[i].helper == helper) {
+					if (out) *out = s_v567_ctx[i];
+					found = true;
+					break;
+				}
+			}
+		}
+		LeaveCriticalSection(&s_v567_lock);
+		return found;
+	}
+
+	static bool V565IsBadActorByFID(UInt32 fullFID)
+	{
+		UInt32 local = fullFID & 0x00FFFFFF;
+		for (UInt32 i = 0; i < kBadActorCount; i++) {
+			if (local == kBadActorLocalFormIDs[i]) return true;
+		}
+		return false;
+	}
+
+	static void __fastcall hook_v567_sub_52CD50(void* race, void* /*edx*/, void* npc, void* helper)
+	{
+		UInt32 npcFID = 0;
+		UInt32 raceFID = 0;
+		bool isBad = false;
+
+		if (npc && IsValidRead((const char*)npc + 0x0C, 4)) {
+			npcFID = *(const UInt32*)((const char*)npc + 0x0C);
+			isBad = V565IsBadActorByFID(npcFID);
+		}
+		if (race && IsValidRead((const char*)race + 0x0C, 4)) {
+			raceFID = *(const UInt32*)((const char*)race + 0x0C);
+		}
+
+		UInt32 expL = race ? ((UInt32)race + 0x188) : 0;
+		UInt32 expR = race ? ((UInt32)race + 0x1A0) : 0;
+
+		// Always record (so downstream lookups work for everyone), log only bad actors.
+		if (helper) {
+			V565RecordContext(helper, npcFID, raceFID, expL, expR);
+		}
+
+		// Run original.
+		orig_sub_52CD50(race, NULL, npc, helper);
+
+		// Snapshot eyeLeft AFTER sub_52CD50 wrote it.
+		if (isBad && helper && IsValidRead((const char*)helper + 0xBC, 4)) {
+			UInt32 eyeL = *(const UInt32*)((const char*)helper + 0xB8);
+			UInt32 eyeR = *(const UInt32*)((const char*)helper + 0xBC);
+			LONG n = InterlockedIncrement(&s_v567_log_52CD50);
+			if (n <= 30 || (n % 100) == 0) {
+				const char* tag = (eyeL == expL) ? "OK" : "MISMATCH";
+				_MESSAGE("[V565] 52CD50 EXIT #%ld npc=%08X race=%08X helper=%p eyeL=%08X(exp=%08X) eyeR=%08X(exp=%08X) %s tid=%lu",
+				         n, npcFID, raceFID, helper, eyeL, expL, eyeR, expR, tag,
+				         GetCurrentThreadId());
+			}
+		}
+	}
+
+	static void __cdecl hook_v567_sub_555A80(void* out1, void* out2, void* helper, char flag)
+	{
+		LONG n = InterlockedIncrement(&s_v567_log_555A80);
+
+		// Unconditional first-N log — proves the hook fires even when our filter rejects.
+		if (n <= 30) {
+			UInt32 eyeL = 0, eyeR = 0;
+			bool readable = (helper && IsValidRead((const char*)helper + 0xBC, 4));
+			if (readable) {
+				eyeL = *(const UInt32*)((const char*)helper + 0xB8);
+				eyeR = *(const UInt32*)((const char*)helper + 0xBC);
+			}
+			V565Context ctx; ZeroMemory(&ctx, sizeof(ctx));
+			bool gotCtx = V565LookupContext(helper, &ctx);
+			bool isBad = gotCtx && V565IsBadActorByFID(ctx.npcFID);
+			_MESSAGE("[V565] 555A80 ENTRY #%ld helper=%p readable=%d eyeL=%08X eyeR=%08X gotCtx=%d npc=%08X canonExpL=%08X bad=%d tid=%lu",
+			         n, helper, readable ? 1 : 0, eyeL, eyeR,
+			         gotCtx ? 1 : 0, ctx.npcFID, ctx.expectedEyeLeft,
+			         isBad ? 1 : 0, GetCurrentThreadId());
+		}
+		orig_sub_555A80(out1, out2, helper, flag);
+	}
+
+	static void __fastcall hook_v567_sub_52DED0(void* race, void* /*edx*/, void* a1, void* a2, void* npc, void* a4, void* a5)
+	{
+		LONG n = InterlockedIncrement(&s_v567_log_52DED0);
+		if (n <= 30) {
+			UInt32 npcFID = 0, raceFID = 0;
+			if (npc && IsValidRead((const char*)npc + 0x0C, 4)) {
+				npcFID = *(const UInt32*)((const char*)npc + 0x0C);
+			}
+			if (race && IsValidRead((const char*)race + 0x0C, 4)) {
+				raceFID = *(const UInt32*)((const char*)race + 0x0C);
+			}
+			_MESSAGE("[V566] 52DED0 ENTRY #%ld race=%p(%08X) npc=%p(%08X) a1=%p a2=%p a4=%p a5=%p tid=%lu",
+			         n, race, raceFID, npc, npcFID, a1, a2, a4, a5, GetCurrentThreadId());
+		}
+		orig_v567_sub_52DED0(race, NULL, a1, a2, npc, a4, a5);
+	}
+
+	static void __cdecl hook_v567_sub_5547F0(void* out1, void* out2, void* helper, char flag)
+	{
+		LONG n = InterlockedIncrement(&s_v567_log_5547F0);
+
+		// Unconditional first-N log to prove hook fires.
+		if (n <= 30) {
+			UInt32 eyeL = 0, eyeR = 0, vtableAtEyeL = 0;
+			bool readable = (helper && IsValidRead((const char*)helper + 0xBC, 4));
+			bool eyeLReadable = false;
+			if (readable) {
+				eyeL = *(const UInt32*)((const char*)helper + 0xB8);
+				eyeR = *(const UInt32*)((const char*)helper + 0xBC);
+				if (eyeL && IsValidRead((const void*)eyeL, 4)) {
+					vtableAtEyeL = *(const UInt32*)eyeL;
+					eyeLReadable = true;
+				}
+			}
+			V565Context ctx; ZeroMemory(&ctx, sizeof(ctx));
+			bool gotCtx = V565LookupContext(helper, &ctx);
+			_MESSAGE("[V565] 5547F0 ENTRY #%ld helper=%p readable=%d eyeL=%08X(canon=%08X) eyeR=%08X [eyeL]=%08X eyeLReadable=%d gotCtx=%d npc=%08X tid=%lu",
+			         n, helper, readable ? 1 : 0, eyeL, ctx.expectedEyeLeft, eyeR,
+			         vtableAtEyeL, eyeLReadable ? 1 : 0, gotCtx ? 1 : 0, ctx.npcFID,
+			         GetCurrentThreadId());
+		}
+		orig_sub_5547F0(out1, out2, helper, flag);
+	}
+
 	bool Install()
 	{
 		if (s_installed) return true;
 
-		// Layer 1: LFM NOPs.
+		// v562 strategy: keep every layer that fixed an OBSERVED crash signature,
+		// drop only Layer 6 (the bad-actor blacklist hooks that install a sentinel
+		// face). Layer 6 was a "give up on FaceGen for these NPCs" workaround for
+		// the cancellation-cycle UAF; v557 fixes that race upstream, so the
+		// give-up isn't needed and was the thing hiding the face.
+		//
+		//   KEEP: Layer 1 (LFM NOPs), Layer 2 (sub_52DED0 mutex),
+		//         Layer 3 (AgeMorphTable redirect), Layer 4 (DoSomething FGP
+		//         validator), Layer 5 (eye binary patches),
+		//         v557 (Set3D-NULL skip — narrowed to tracked-only),
+		//         v558 (FUN_004D6BF0 skip — already tracked-only)
+		//   DROP: Layer 6 hooks (sub_4348B0/sub_435300/sub_522260/sub_528D90),
+		//         InitSentinel(), v559 probes (diagnostic-only)
+
+		// Layer 1: LFM NOPs — patches the deferred-free chain, prevents UAF.
 		_MemHdlr(BucketArrayFreeChainA).WriteNop();
 		_MemHdlr(BucketArrayFreeChainB).WriteNop();
-		_MESSAGE("[RBRN] EngineRaceFix: LFM bucket-array FormHeapFree NOPs applied");
+		_MESSAGE("[RBRN] EngineRaceFix v567: LFM bucket-array FormHeapFree NOPs applied");
 
-		// Layer 3: AgeMorphTable validation-failure redirect (0x006EDDD4 -> 0x006EDD8F).
+		// Layer 3: AgeMorphTable validation-failure redirect.
 		WriteRelJump(0x006EDDD4, 0x006EDD8F);
 		_MESSAGE("[RBRN] EngineRaceFix: AgeMorphTable validation-failure redirect installed (0x006EDDD4 -> 0x006EDD8F)");
 
-		// Layer 5 (v538+): sub_5547F0 eyeLeft + eyeRight validity patches.
-		// Catches FGP+0xB8/0xBC corruption where the engine writes a low-value
-		// (formID-shaped) value into the slot, defeating the existing NULL check.
+		// Layer 5: sub_5547F0 eyeLeft + eyeRight validity patches.
 		InstallEyeLeftValidityPatch();
 		InstallEyeRightValidityPatch();
 
-		// Layer 6 (v541): BSFaceGenNiNode sentinel for storm-stop.
-		// Hook QueuedHead::Run; for bad actors install sentinel face nodes so the
-		// engine stops re-queueing → eliminates LFM hazard-pointer protocol stress.
-		InitSentinel();
-
-		// Layers 2 + 4: Detours hooks.
+		// Layer 2 + Layer 4 + v557 + v558 hooks. Layer 6 (sub_435300, sub_522260,
+		// sub_528D90, sub_4348B0) and v559 probes (438060, 46A9E0, 46ABA0) are
+		// intentionally NOT attached.
 		InitializeCriticalSectionAndSpinCount(&s_facegenLock, 4000);
 
 		LONG err = DetourTransactionBegin();
@@ -1282,18 +1684,21 @@ namespace EngineRaceFix
 		}
 		DetourUpdateThread(GetCurrentThread());
 
-		err |= DetourAttach(&(PVOID&)orig_sub_52DED0,  hook_sub_52DED0);
-		err |= DetourAttach(&(PVOID&)orig_sub_435300,  hook_sub_435300);
-		err |= DetourAttach(&(PVOID&)orig_sub_522260,  hook_sub_522260);
-		err |= DetourAttach(&(PVOID&)orig_sub_528D90,  hook_sub_528D90);
-		err |= DetourAttach(&(PVOID&)orig_sub_4348B0,  hook_sub_4348B0);
-		err |= DetourAttach(&(PVOID&)orig_DoSomething, hook_DoSomething);
-		// v547 (sub_5221C0), v548 (FUN_0043B000), v549 (FUN_0043D000) probes RETIRED.
-		// v549's FUN_0043D000 hook accidentally throttled the storm via probe latency.
-		// v550 probes target the canonical refr+0x3C writer + body sub-task enqueue.
-		err |= DetourAttach(&(PVOID&)orig_FUN_004D7D10, hook_FUN_004D7D10);  // [RBRN] v550 probe — canonical refr+0x3C writer
-		err |= DetourAttach(&(PVOID&)orig_FUN_004E0F80, hook_FUN_004E0F80);  // [RBRN] v554/557 probe + FIX — Set3D
-		err |= DetourAttach(&(PVOID&)orig_FUN_004D6BF0, hook_FUN_004D6BF0);  // [RBRN] v558 FIX — direct Detach3D clearer
+		// v567 INSTRUMENTATION: attach 3 probe hooks to capture eyeLeft progression.
+		// We accept that the game will crash for bad-actor NPCs since sub_52DED0
+		// short-circuit is intentionally OFF — we just need a few log entries
+		// before the crash to identify the corruption window.
+		InitializeCriticalSectionAndSpinCount(&s_v567_lock, 4000);
+		s_v567_lockInit = true;
+		ZeroMemory(&s_v567_ctx, sizeof(s_v567_ctx));
+
+		err |= DetourAttach(&(PVOID&)orig_DoSomething,    hook_DoSomething);     // Layer 4
+		err |= DetourAttach(&(PVOID&)orig_FUN_004E0F80,   hook_FUN_004E0F80);    // v557 (tracked-only)
+		err |= DetourAttach(&(PVOID&)orig_FUN_004D6BF0,   hook_FUN_004D6BF0);    // v558 (tracked-only)
+		err |= DetourAttach(&(PVOID&)orig_sub_52CD50,     hook_v567_sub_52CD50); // v567 probe
+		err |= DetourAttach(&(PVOID&)orig_sub_555A80,     hook_v567_sub_555A80); // v567 probe
+		err |= DetourAttach(&(PVOID&)orig_sub_5547F0,     hook_v567_sub_5547F0); // v567 probe
+		err |= DetourAttach(&(PVOID&)orig_v567_sub_52DED0, hook_v567_sub_52DED0); // v567 probe
 
 		if (err != NO_ERROR) {
 			_ERROR("[RBRN] EngineRaceFix: DetourAttach failed (%ld)", err);
@@ -1310,7 +1715,7 @@ namespace EngineRaceFix
 		}
 
 		s_installed = true;
-		_MESSAGE("[RBRN] EngineRaceFix: stack ready (LFM NOPs + sub_52DED0 mutex + AgeMorphTable redirect + DoSomething FGP validator)");
+		_MESSAGE("[RBRN] EngineRaceFix v567 INSTRUMENTATION: LFM NOPs + AgeMorphTable + eye patches + DoSomething FGP validator + Set3D/Detach3D tracked + sub_52CD50/555A80/5547F0 PROBES (game will crash on bad actors — capturing eyeLeft progression)");
 		return true;
 	}
 
@@ -1320,17 +1725,19 @@ namespace EngineRaceFix
 
 		DetourTransactionBegin();
 		DetourUpdateThread(GetCurrentThread());
-		DetourDetach(&(PVOID&)orig_sub_52DED0,  hook_sub_52DED0);
-		DetourDetach(&(PVOID&)orig_sub_435300,  hook_sub_435300);
-		DetourDetach(&(PVOID&)orig_sub_522260,  hook_sub_522260);
-		DetourDetach(&(PVOID&)orig_sub_528D90,  hook_sub_528D90);
-		DetourDetach(&(PVOID&)orig_sub_4348B0,  hook_sub_4348B0);
-		DetourDetach(&(PVOID&)orig_DoSomething, hook_DoSomething);
-		DetourDetach(&(PVOID&)orig_FUN_004D7D10, hook_FUN_004D7D10);  // [RBRN] v550 probe
-		DetourDetach(&(PVOID&)orig_FUN_004E0F80, hook_FUN_004E0F80);  // [RBRN] v554/557
-		DetourDetach(&(PVOID&)orig_FUN_004D6BF0, hook_FUN_004D6BF0);  // [RBRN] v558
+		DetourDetach(&(PVOID&)orig_DoSomething,    hook_DoSomething);
+		DetourDetach(&(PVOID&)orig_FUN_004E0F80,   hook_FUN_004E0F80);
+		DetourDetach(&(PVOID&)orig_FUN_004D6BF0,   hook_FUN_004D6BF0);
+		DetourDetach(&(PVOID&)orig_sub_52CD50,     hook_v567_sub_52CD50);
+		DetourDetach(&(PVOID&)orig_sub_555A80,     hook_v567_sub_555A80);
+		DetourDetach(&(PVOID&)orig_sub_5547F0,     hook_v567_sub_5547F0);
+		DetourDetach(&(PVOID&)orig_v567_sub_52DED0, hook_v567_sub_52DED0);
 		DetourTransactionCommit();
 		DeleteCriticalSection(&s_facegenLock);
+		if (s_v567_lockInit) {
+			DeleteCriticalSection(&s_v567_lock);
+			s_v567_lockInit = false;
+		}
 
 		s_installed = false;
 	}

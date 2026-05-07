@@ -769,14 +769,22 @@ void __stdcall DoTESRaceGetFaceGenHeadParametersHook(TESRace* Race, FaceGenHeadP
 			_MESSAGE("[RBRN] RETRY-LOOP detected for NPC=%08X FGP=%p - hard-skipping (no engine call)",
 				NPC ? NPC->refID : 0, FaceGenParams);
 		}
-		// [RBRN] Fix 9: do NOT call the engine's original GetFaceGenHeadParameters on
-		// duplicates. The previous "call original to satisfy the engine" approach
-		// (inherited from the prior session's instrumentation) appears to enqueue an
-		// extra QueuedHead on every retry call — which Set3D later dequeues and
-		// dereferences NULL through (mounted-actor patrol crash signature). The first
-		// (non-duplicate) call already populated the FGP; the engine should have what
-		// it needs. If the engine retries indefinitely on the same (NPC, FGP) we'll
-		// see a freeze rather than a crash, which still confirms the hypothesis shape.
+		// [RBRN] v567 FIX: Fix 9 skipped sub_52CD50 (the original) entirely on dupes,
+		// to avoid the engine queueing extra QueuedHead tasks. But the helper struct
+		// the engine populates is on a worker-thread stack region that gets reused
+		// across calls, AND its ctor (sub_527C90) does NOT initialize +0xB8/+0xBC
+		// (eyeLeft/eyeRight). When we skip sub_52CD50, those fields retain stale
+		// data — sometimes a Blockhead DLL address (0x73130C58 observed v566 #24).
+		// Downstream sub_5547F0 then derefs the stale eyeLeft → AV.
+		//
+		// Fix: replicate sub_52CD50's CANONICAL eyeLeft/eyeRight write (race+0x188
+		// and race+0x1A0, an interior pointer into TESRace.unk9[7] and unk9[8]).
+		// Two pointer assignments. No QueuedHead enqueue (still skip thisCall).
+		// FaceGenHeadParameters.eyeLeft is at +0xB8, eyeRight at +0xBC.
+		if (Race && FaceGenParams) {
+			*(UInt32*)((char*)FaceGenParams + 0xB8) = (UInt32)((char*)Race + 0x188);
+			*(UInt32*)((char*)FaceGenParams + 0xBC) = (UInt32)((char*)Race + 0x1A0);
+		}
 		return;
 	}
 
