@@ -1458,12 +1458,12 @@ namespace EngineRaceFix
 	typedef void (__cdecl* fn_sub_5547F0)(void* out1, void* out2, void* helper, char flag);
 	static fn_sub_5547F0 orig_sub_5547F0 = (fn_sub_5547F0)0x005547F0;
 
-	// v567 — confirm whether sub_52DED0 (the worker-chain chokepoint) is ever invoked.
+	// v568 — confirm whether sub_52DED0 (the worker-chain chokepoint) is ever invoked.
 	// If it never fires, the crash isn't in that chain — it's downstream of Blockhead's
 	// SwapFaceGenHeadData on the synchronous TESRace::GetFaceGenHeadParameters path.
-	typedef void (__fastcall* fn_v567_sub_52DED0)(void* race, void* /*edx*/, void* a1, void* a2, void* npc, void* a4, void* a5);
-	static fn_v567_sub_52DED0 orig_v567_sub_52DED0 = (fn_v567_sub_52DED0)0x0052DED0;
-	static volatile LONG s_v567_log_52DED0 = 0;
+	typedef void (__fastcall* fn_v568_sub_52DED0)(void* race, void* /*edx*/, void* a1, void* a2, void* npc, void* a4, void* a5);
+	static fn_v568_sub_52DED0 orig_v568_sub_52DED0 = (fn_v568_sub_52DED0)0x0052DED0;
+	static volatile LONG s_v568_log_52DED0 = 0;
 
 	struct V565Context {
 		void*  helper;
@@ -1473,40 +1473,40 @@ namespace EngineRaceFix
 		UInt32 expectedEyeRight;  // race+0x1A0
 		DWORD  threadId;
 	};
-	static V565Context  s_v567_ctx[16];
-	static CRITICAL_SECTION s_v567_lock;
-	static bool         s_v567_lockInit = false;
-	static volatile LONG s_v567_ctxIdx = 0;
-	static volatile LONG s_v567_log_52CD50 = 0;
-	static volatile LONG s_v567_log_555A80 = 0;
-	static volatile LONG s_v567_log_5547F0 = 0;
+	static V565Context  s_v568_ctx[16];
+	static CRITICAL_SECTION s_v568_lock;
+	static bool         s_v568_lockInit = false;
+	static volatile LONG s_v568_ctxIdx = 0;
+	static volatile LONG s_v568_log_52CD50 = 0;
+	static volatile LONG s_v568_log_555A80 = 0;
+	static volatile LONG s_v568_log_5547F0 = 0;
 
 	static void V565RecordContext(void* helper, UInt32 npcFID, UInt32 raceFID,
 	                              UInt32 expL, UInt32 expR)
 	{
-		LONG idx = InterlockedIncrement(&s_v567_ctxIdx) % 16;
-		EnterCriticalSection(&s_v567_lock);
-		s_v567_ctx[idx].helper = helper;
-		s_v567_ctx[idx].npcFID = npcFID;
-		s_v567_ctx[idx].raceFID = raceFID;
-		s_v567_ctx[idx].expectedEyeLeft = expL;
-		s_v567_ctx[idx].expectedEyeRight = expR;
-		s_v567_ctx[idx].threadId = GetCurrentThreadId();
-		LeaveCriticalSection(&s_v567_lock);
+		LONG idx = InterlockedIncrement(&s_v568_ctxIdx) % 16;
+		EnterCriticalSection(&s_v568_lock);
+		s_v568_ctx[idx].helper = helper;
+		s_v568_ctx[idx].npcFID = npcFID;
+		s_v568_ctx[idx].raceFID = raceFID;
+		s_v568_ctx[idx].expectedEyeLeft = expL;
+		s_v568_ctx[idx].expectedEyeRight = expR;
+		s_v568_ctx[idx].threadId = GetCurrentThreadId();
+		LeaveCriticalSection(&s_v568_lock);
 	}
 
 	// Lookup most-recent context for a helper (scan all entries, return latest match).
 	// Returns true if found.
 	static bool V565LookupContext(void* helper, V565Context* out)
 	{
-		EnterCriticalSection(&s_v567_lock);
+		EnterCriticalSection(&s_v568_lock);
 		bool found = false;
 		// Scan in reverse from most-recent; tie-break on threadId.
 		DWORD tid = GetCurrentThreadId();
 		// First pass: same-thread match
 		for (int i = 0; i < 16; i++) {
-			if (s_v567_ctx[i].helper == helper && s_v567_ctx[i].threadId == tid) {
-				if (out) *out = s_v567_ctx[i];
+			if (s_v568_ctx[i].helper == helper && s_v568_ctx[i].threadId == tid) {
+				if (out) *out = s_v568_ctx[i];
 				found = true;
 				break;
 			}
@@ -1514,14 +1514,14 @@ namespace EngineRaceFix
 		// Second pass: any-thread match
 		if (!found) {
 			for (int i = 0; i < 16; i++) {
-				if (s_v567_ctx[i].helper == helper) {
-					if (out) *out = s_v567_ctx[i];
+				if (s_v568_ctx[i].helper == helper) {
+					if (out) *out = s_v568_ctx[i];
 					found = true;
 					break;
 				}
 			}
 		}
-		LeaveCriticalSection(&s_v567_lock);
+		LeaveCriticalSection(&s_v568_lock);
 		return found;
 	}
 
@@ -1534,7 +1534,7 @@ namespace EngineRaceFix
 		return false;
 	}
 
-	static void __fastcall hook_v567_sub_52CD50(void* race, void* /*edx*/, void* npc, void* helper)
+	static void __fastcall hook_v568_sub_52CD50(void* race, void* /*edx*/, void* npc, void* helper)
 	{
 		UInt32 npcFID = 0;
 		UInt32 raceFID = 0;
@@ -1563,7 +1563,7 @@ namespace EngineRaceFix
 		if (isBad && helper && IsValidRead((const char*)helper + 0xBC, 4)) {
 			UInt32 eyeL = *(const UInt32*)((const char*)helper + 0xB8);
 			UInt32 eyeR = *(const UInt32*)((const char*)helper + 0xBC);
-			LONG n = InterlockedIncrement(&s_v567_log_52CD50);
+			LONG n = InterlockedIncrement(&s_v568_log_52CD50);
 			if (n <= 30 || (n % 100) == 0) {
 				const char* tag = (eyeL == expL) ? "OK" : "MISMATCH";
 				_MESSAGE("[V565] 52CD50 EXIT #%ld npc=%08X race=%08X helper=%p eyeL=%08X(exp=%08X) eyeR=%08X(exp=%08X) %s tid=%lu",
@@ -1573,9 +1573,9 @@ namespace EngineRaceFix
 		}
 	}
 
-	static void __cdecl hook_v567_sub_555A80(void* out1, void* out2, void* helper, char flag)
+	static void __cdecl hook_v568_sub_555A80(void* out1, void* out2, void* helper, char flag)
 	{
-		LONG n = InterlockedIncrement(&s_v567_log_555A80);
+		LONG n = InterlockedIncrement(&s_v568_log_555A80);
 
 		// Unconditional first-N log — proves the hook fires even when our filter rejects.
 		if (n <= 30) {
@@ -1596,9 +1596,9 @@ namespace EngineRaceFix
 		orig_sub_555A80(out1, out2, helper, flag);
 	}
 
-	static void __fastcall hook_v567_sub_52DED0(void* race, void* /*edx*/, void* a1, void* a2, void* npc, void* a4, void* a5)
+	static void __fastcall hook_v568_sub_52DED0(void* race, void* /*edx*/, void* a1, void* a2, void* npc, void* a4, void* a5)
 	{
-		LONG n = InterlockedIncrement(&s_v567_log_52DED0);
+		LONG n = InterlockedIncrement(&s_v568_log_52DED0);
 		if (n <= 30) {
 			UInt32 npcFID = 0, raceFID = 0;
 			if (npc && IsValidRead((const char*)npc + 0x0C, 4)) {
@@ -1610,12 +1610,12 @@ namespace EngineRaceFix
 			_MESSAGE("[V566] 52DED0 ENTRY #%ld race=%p(%08X) npc=%p(%08X) a1=%p a2=%p a4=%p a5=%p tid=%lu",
 			         n, race, raceFID, npc, npcFID, a1, a2, a4, a5, GetCurrentThreadId());
 		}
-		orig_v567_sub_52DED0(race, NULL, a1, a2, npc, a4, a5);
+		orig_v568_sub_52DED0(race, NULL, a1, a2, npc, a4, a5);
 	}
 
-	static void __cdecl hook_v567_sub_5547F0(void* out1, void* out2, void* helper, char flag)
+	static void __cdecl hook_v568_sub_5547F0(void* out1, void* out2, void* helper, char flag)
 	{
-		LONG n = InterlockedIncrement(&s_v567_log_5547F0);
+		LONG n = InterlockedIncrement(&s_v568_log_5547F0);
 
 		// Unconditional first-N log to prove hook fires.
 		if (n <= 30) {
@@ -1640,6 +1640,73 @@ namespace EngineRaceFix
 		orig_sub_5547F0(out1, out2, helper, flag);
 	}
 
+	// =============================================================================
+	// [V568] Storm-refr body-load investigation.
+	//
+	// CONTEXT (post-v568): Two patrol refrs `0x70106` (VirtueRider) + `0x70107`
+	// (his horse) are stable (no crash thanks to v557+v558) but body never installs.
+	// Per END_TO_END_v2 trace and v565/v566 probe data, TESCharacter::Update
+	// (FUN_004E0580 line 200) has a per-frame check:
+	//
+	//     if (refr.flags & (1<<5 | 1<<11)) → vtable[0x54](0)         // tear-down
+	//     else if (refr+0x3C == 0 && refr+0x40 != 0 && fmtype is actor)
+	//         ModelLoader::QueueReference(refr, ...)                   // queue load
+	//
+	// For the storm refrs, runtime flags have bit 5 OR bit 11 set, so engine
+	// always takes the tear-down branch and never queues body load. v559 probes
+	// confirmed: zero QueueReference events for tracked refrs across an entire
+	// session. v559 also confirmed the official bit-5/bit-11 setters
+	// (FUN_0046A9E0 / FUN_0046ABA0) NEVER fire for tracked refrs — meaning the
+	// bits are set by some path we haven't traced (direct memory write, or set
+	// at cell-attach before our hooks attach).
+	//
+	// v568 strategy: hook TESCharacter::Update entry, observe flags state, and
+	// force-clear bits 5/11 for tracked storm refrs BEFORE orig runs. If body
+	// load now queues and the refr renders, we have a working empirical fix
+	// (with the caveat that we don't fully understand the bit semantics —
+	// they might gate other behavior we haven't observed yet).
+	// =============================================================================
+
+	typedef void (__fastcall* fn_TESCharacterUpdate)(void* refr, void* /*edx*/, UInt32 param);
+	static fn_TESCharacterUpdate orig_TESCharacterUpdate = (fn_TESCharacterUpdate)0x004E0580;
+	static volatile LONG s_v568_log_count = 0;
+	static volatile LONG s_v568_clear_count = 0;
+
+	// Set false to observe-only without modifying flags.
+	static const bool kV568ForceClear = true;
+
+	static void __fastcall hook_v568_TESCharacterUpdate(void* refr, void* /*edx*/, UInt32 param)
+	{
+		if (refr) {
+			UInt32 refrFID = *(UInt32*)((char*)refr + 0x0C);
+			bool tracked = (refrFID == 0x00070106) || (refrFID == 0x00070107);
+			if (tracked) {
+				UInt32 flagsBefore = *(UInt32*)((char*)refr + 0x08);
+				int bit5  = (flagsBefore >> 5) & 1;
+				int bit11 = (flagsBefore >> 11) & 1;
+
+				LONG n = InterlockedIncrement(&s_v568_log_count);
+
+				if (kV568ForceClear && (bit5 || bit11)) {
+					UInt32 flagsAfter = flagsBefore & ~((1U << 5) | (1U << 11));
+					*(UInt32*)((char*)refr + 0x08) = flagsAfter;
+					LONG c = InterlockedIncrement(&s_v568_clear_count);
+					if (c <= 30 || (c % 200) == 0) {
+						_MESSAGE("[V568] TESCharUpdate #%ld CLEAR fid=%08X param=%08X before=%08X(b5=%d b11=%d) after=%08X tid=%lu",
+						         c, refrFID, param, flagsBefore, bit5, bit11, flagsAfter,
+						         GetCurrentThreadId());
+					}
+				}
+				else if (n <= 30 || (n % 500) == 0) {
+					_MESSAGE("[V568] TESCharUpdate #%ld OBSERVE fid=%08X param=%08X flags=%08X(b5=%d b11=%d) tid=%lu",
+					         n, refrFID, param, flagsBefore, bit5, bit11,
+					         GetCurrentThreadId());
+				}
+			}
+		}
+		orig_TESCharacterUpdate(refr, NULL, param);
+	}
+
 	bool Install()
 	{
 		if (s_installed) return true;
@@ -1661,7 +1728,7 @@ namespace EngineRaceFix
 		// Layer 1: LFM NOPs — patches the deferred-free chain, prevents UAF.
 		_MemHdlr(BucketArrayFreeChainA).WriteNop();
 		_MemHdlr(BucketArrayFreeChainB).WriteNop();
-		_MESSAGE("[RBRN] EngineRaceFix v567: LFM bucket-array FormHeapFree NOPs applied");
+		_MESSAGE("[RBRN] EngineRaceFix v568: LFM bucket-array FormHeapFree NOPs applied");
 
 		// Layer 3: AgeMorphTable validation-failure redirect.
 		WriteRelJump(0x006EDDD4, 0x006EDD8F);
@@ -1684,21 +1751,14 @@ namespace EngineRaceFix
 		}
 		DetourUpdateThread(GetCurrentThread());
 
-		// v567 INSTRUMENTATION: attach 3 probe hooks to capture eyeLeft progression.
-		// We accept that the game will crash for bad-actor NPCs since sub_52DED0
-		// short-circuit is intentionally OFF — we just need a few log entries
-		// before the crash to identify the corruption window.
-		InitializeCriticalSectionAndSpinCount(&s_v567_lock, 4000);
-		s_v567_lockInit = true;
-		ZeroMemory(&s_v567_ctx, sizeof(s_v567_ctx));
-
-		err |= DetourAttach(&(PVOID&)orig_DoSomething,    hook_DoSomething);     // Layer 4
-		err |= DetourAttach(&(PVOID&)orig_FUN_004E0F80,   hook_FUN_004E0F80);    // v557 (tracked-only)
-		err |= DetourAttach(&(PVOID&)orig_FUN_004D6BF0,   hook_FUN_004D6BF0);    // v558 (tracked-only)
-		err |= DetourAttach(&(PVOID&)orig_sub_52CD50,     hook_v567_sub_52CD50); // v567 probe
-		err |= DetourAttach(&(PVOID&)orig_sub_555A80,     hook_v567_sub_555A80); // v567 probe
-		err |= DetourAttach(&(PVOID&)orig_sub_5547F0,     hook_v567_sub_5547F0); // v567 probe
-		err |= DetourAttach(&(PVOID&)orig_v567_sub_52DED0, hook_v567_sub_52DED0); // v567 probe
+		// v568 INSTRUMENTATION: attach 3 probe hooks to capture eyeLeft progression.
+		// v569 PRODUCTION: only attach proven crash-prevention hooks.
+		// All v559/v565/v566/v568 diagnostic probes stripped.
+		// Layer 6 (bad-actor blacklist sentinel-install) hooks stay defined for
+		// reference but are NOT attached — v567 fixes the actual crash upstream.
+		err |= DetourAttach(&(PVOID&)orig_DoSomething,    hook_DoSomething);    // Layer 4: NULL FGP-array validator
+		err |= DetourAttach(&(PVOID&)orig_FUN_004E0F80,   hook_FUN_004E0F80);   // v557: Set3D-NULL skip for tracked storm refrs
+		err |= DetourAttach(&(PVOID&)orig_FUN_004D6BF0,   hook_FUN_004D6BF0);   // v558: FUN_004D6BF0 direct-clear skip for tracked
 
 		if (err != NO_ERROR) {
 			_ERROR("[RBRN] EngineRaceFix: DetourAttach failed (%ld)", err);
@@ -1715,7 +1775,7 @@ namespace EngineRaceFix
 		}
 
 		s_installed = true;
-		_MESSAGE("[RBRN] EngineRaceFix v567 INSTRUMENTATION: LFM NOPs + AgeMorphTable + eye patches + DoSomething FGP validator + Set3D/Detach3D tracked + sub_52CD50/555A80/5547F0 PROBES (game will crash on bad actors — capturing eyeLeft progression)");
+		_MESSAGE("[RBRN] EngineRaceFix v569 PRODUCTION: LFM NOPs + AgeMorphTable redirect + eye validity patches + DoSomething FGP validator + Set3D/Detach3D skip for tracked storm refrs. Plus HeadOverride dupe-skip eyeLeft canonical-write fix (v567).");
 		return true;
 	}
 
@@ -1725,19 +1785,11 @@ namespace EngineRaceFix
 
 		DetourTransactionBegin();
 		DetourUpdateThread(GetCurrentThread());
-		DetourDetach(&(PVOID&)orig_DoSomething,    hook_DoSomething);
-		DetourDetach(&(PVOID&)orig_FUN_004E0F80,   hook_FUN_004E0F80);
-		DetourDetach(&(PVOID&)orig_FUN_004D6BF0,   hook_FUN_004D6BF0);
-		DetourDetach(&(PVOID&)orig_sub_52CD50,     hook_v567_sub_52CD50);
-		DetourDetach(&(PVOID&)orig_sub_555A80,     hook_v567_sub_555A80);
-		DetourDetach(&(PVOID&)orig_sub_5547F0,     hook_v567_sub_5547F0);
-		DetourDetach(&(PVOID&)orig_v567_sub_52DED0, hook_v567_sub_52DED0);
+		DetourDetach(&(PVOID&)orig_DoSomething,  hook_DoSomething);
+		DetourDetach(&(PVOID&)orig_FUN_004E0F80, hook_FUN_004E0F80);
+		DetourDetach(&(PVOID&)orig_FUN_004D6BF0, hook_FUN_004D6BF0);
 		DetourTransactionCommit();
 		DeleteCriticalSection(&s_facegenLock);
-		if (s_v567_lockInit) {
-			DeleteCriticalSection(&s_v567_lock);
-			s_v567_lockInit = false;
-		}
 
 		s_installed = false;
 	}
