@@ -754,6 +754,18 @@ void SwapFaceGenHeadData(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TE
 
 void __stdcall DoTESRaceGetFaceGenHeadParametersHook(TESRace* Race, FaceGenHeadParameters* FaceGenParams, TESNPC* NPC)
 {
+	// [RBRN] Sync-storm stopper: FaceGenProbe installs a sentinel BSFaceGenNiNode
+	// in NPC->face0/face1 when retiring storm NPCs. If both are already non-NULL,
+	// FaceGen is done for this NPC — skip the entire engine call. This stops the
+	// synchronous GetFaceGenHeadParameters retry storm at its source.
+	if (NPC) {
+		void* face0 = *(void**)((char*)NPC + 0x1D4);
+		void* face1 = *(void**)((char*)NPC + 0x1D8);
+		if (face0 && face1) {
+			return;
+		}
+	}
+
 	// [RBRN] retry-loop guard: if the engine re-queues GetFaceGenHeadParameters with the
 	// same (NPC, FaceGenParams) tuple consecutively, skip the swap. Some NPC base records
 	// (e.g. OOO VirtueRider 000700CC) put the engine into a tight retry loop where each
