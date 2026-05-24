@@ -1711,36 +1711,34 @@ namespace EngineRaceFix
 	{
 		if (s_installed) return true;
 
-		// v562 strategy: keep every layer that fixed an OBSERVED crash signature,
-		// drop only Layer 6 (the bad-actor blacklist hooks that install a sentinel
-		// face). Layer 6 was a "give up on FaceGen for these NPCs" workaround for
-		// the cancellation-cycle UAF; v557 fixes that race upstream, so the
-		// give-up isn't needed and was the thing hiding the face.
-		//
-		//   KEEP: Layer 1 (LFM NOPs), Layer 2 (sub_52DED0 mutex),
-		//         Layer 3 (AgeMorphTable redirect), Layer 4 (DoSomething FGP
-		//         validator), Layer 5 (eye binary patches),
-		//         v557 (Set3D-NULL skip — narrowed to tracked-only),
-		//         v558 (FUN_004D6BF0 skip — already tracked-only)
-		//   DROP: Layer 6 hooks (sub_4348B0/sub_435300/sub_522260/sub_528D90),
-		//         InitSentinel(), v559 probes (diagnostic-only)
+		// [RBRN] v582: With FaceGenProbe Build 42 (counter=6 + sentinel) + sync-storm
+		// stopper in HeadOverride, both FaceGen storms are dead at source. The crash-fix
+		// layers below were symptom handlers for LFM queue pressure from those storms.
+		// With storms gone, they may be unnecessary. Set to false to disable.
+		static const bool kEnableCrashFixLayers = true;
 
 		// Layer 1: LFM NOPs — patches the deferred-free chain, prevents UAF.
-		_MemHdlr(BucketArrayFreeChainA).WriteNop();
-		_MemHdlr(BucketArrayFreeChainB).WriteNop();
-		_MESSAGE("[RBRN] EngineRaceFix v568: LFM bucket-array FormHeapFree NOPs applied");
+		if (kEnableCrashFixLayers) {
+			_MemHdlr(BucketArrayFreeChainA).WriteNop();
+			_MemHdlr(BucketArrayFreeChainB).WriteNop();
+			_MESSAGE("[RBRN] EngineRaceFix: LFM bucket-array FormHeapFree NOPs applied");
+		}
 
 		// Layer 3: AgeMorphTable validation-failure redirect.
-		WriteRelJump(0x006EDDD4, 0x006EDD8F);
-		_MESSAGE("[RBRN] EngineRaceFix: AgeMorphTable validation-failure redirect installed (0x006EDDD4 -> 0x006EDD8F)");
+		if (kEnableCrashFixLayers) {
+			WriteRelJump(0x006EDDD4, 0x006EDD8F);
+			_MESSAGE("[RBRN] EngineRaceFix: AgeMorphTable validation-failure redirect installed (0x006EDDD4 -> 0x006EDD8F)");
+		}
 
 		// Layer 5: sub_5547F0 eyeLeft + eyeRight validity patches.
-		InstallEyeLeftValidityPatch();
-		InstallEyeRightValidityPatch();
+		if (kEnableCrashFixLayers) {
+			InstallEyeLeftValidityPatch();
+			InstallEyeRightValidityPatch();
+		}
 
-		// Layer 2 + Layer 4 + v557 + v558 hooks. Layer 6 (sub_435300, sub_522260,
-		// sub_528D90, sub_4348B0) and v559 probes (438060, 46A9E0, 46ABA0) are
-		// intentionally NOT attached.
+		// Layer 4 + v557 + v558 hooks. Layer 4 (DoSomething FGP validator) is
+		// disabled by kEnableCrashFixLayers. v557 (Set3D-NULL skip) and v558
+		// (FUN_004D6BF0 skip) are kept independent of the flag.
 		InitializeCriticalSectionAndSpinCount(&s_facegenLock, 4000);
 
 		LONG err = DetourTransactionBegin();
@@ -1751,12 +1749,9 @@ namespace EngineRaceFix
 		}
 		DetourUpdateThread(GetCurrentThread());
 
-		// v568 INSTRUMENTATION: attach 3 probe hooks to capture eyeLeft progression.
-		// v569 PRODUCTION: only attach proven crash-prevention hooks.
-		// All v559/v565/v566/v568 diagnostic probes stripped.
-		// Layer 6 (bad-actor blacklist sentinel-install) hooks stay defined for
-		// reference but are NOT attached — v567 fixes the actual crash upstream.
-		err |= DetourAttach(&(PVOID&)orig_DoSomething,    hook_DoSomething);    // Layer 4: NULL FGP-array validator
+		if (kEnableCrashFixLayers) {
+			err |= DetourAttach(&(PVOID&)orig_DoSomething,    hook_DoSomething);    // Layer 4: NULL FGP-array validator
+		}
 		err |= DetourAttach(&(PVOID&)orig_FUN_004E0F80,   hook_FUN_004E0F80);   // v557: Set3D-NULL skip for tracked storm refrs
 		err |= DetourAttach(&(PVOID&)orig_FUN_004D6BF0,   hook_FUN_004D6BF0);   // v558: FUN_004D6BF0 direct-clear skip for tracked
 
@@ -1775,7 +1770,8 @@ namespace EngineRaceFix
 		}
 
 		s_installed = true;
-		_MESSAGE("[RBRN] EngineRaceFix v581 PRODUCTION: re-applies v570's 50ms time-based reset on thread_local retry-loop dedup state. Hotel head-loss fix the user originally validated on save loads (the earlier 'new game crashes' was PSMQD/LINK.esp UI null-deref, since fixed). No Detach3D modifications.");
+		_MESSAGE("[RBRN] EngineRaceFix v582: crash-fix layers %s. v557 Set3D skip + v558 4D6BF0 skip active.",
+			kEnableCrashFixLayers ? "ENABLED" : "DISABLED");
 		return true;
 	}
 
