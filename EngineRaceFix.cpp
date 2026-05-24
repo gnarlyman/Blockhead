@@ -1775,7 +1775,7 @@ namespace EngineRaceFix
 		}
 
 		s_installed = true;
-		_MESSAGE("[RBRN] EngineRaceFix v569 PRODUCTION: LFM NOPs + AgeMorphTable redirect + eye validity patches + DoSomething FGP validator + Set3D/Detach3D skip for tracked storm refrs. Plus HeadOverride dupe-skip eyeLeft canonical-write fix (v567).");
+		_MESSAGE("[RBRN] EngineRaceFix v581 PRODUCTION: re-applies v570's 50ms time-based reset on thread_local retry-loop dedup state. Hotel head-loss fix the user originally validated on save loads (the earlier 'new game crashes' was PSMQD/LINK.esp UI null-deref, since fixed). No Detach3D modifications.");
 		return true;
 	}
 

@@ -1,6 +1,7 @@
 #include "HeadOverride.h"
 #include "FastPath.h"
 
+#include <windows.h>  // GetTickCount for v581 retry-guard time-based reset
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
@@ -758,9 +759,53 @@ void __stdcall DoTESRaceGetFaceGenHeadParametersHook(TESRace* Race, FaceGenHeadP
 	// (e.g. OOO VirtueRider 000700CC) put the engine into a tight retry loop where each
 	// SwapFaceGenHeadData causes the queued FaceGen task to be re-submitted, leading to a
 	// BSTask-thread UAF crash on Set3D. Single-slot dedup is enough to break the cycle.
+	//
+	// [RBRN] v581 (re-applies v570): time-based reset on the thread_local dedup state.
+	// The retry-loop fires many calls within ONE engine frame (sub-millisecond gaps),
+	// so any real-time elapsed >50ms means this thread is no longer inside a retry
+	// burst — it's processing a fresh FaceGen event (cell reload, save load). Reset
+	// the lock so the same (NPC, FGP) tuple gets a clean look-up instead of being
+	// mis-classified as a retry-loop continuation.
+	//
+	// The user reported v570 worked on save loads — earlier "new game crash" was
+	// PSMQD/LINK.esp UI null-deref, not retry-loop dedup. Confirmed 2026-05-11.
 	static thread_local TESNPC* lastNPC = nullptr;
 	static thread_local FaceGenHeadParameters* lastFGP = nullptr;
 	static thread_local UInt32 dupeCount = 0;
+	static thread_local DWORD lastTickMs = 0;
+
+	// [RBRN] STORM DIAGNOSTIC: count calls per NPC in a sliding window.
+	// Every 5 seconds, report any NPC with >100 calls. Proves storm frequency.
+	static thread_local UInt32 s_diagNPCs[16] = {};
+	static thread_local UInt32 s_diagCounts[16] = {};
+	static thread_local DWORD  s_diagWindowStart = 0;
+
+	DWORD nowMs = GetTickCount();
+	if (nowMs - s_diagWindowStart > 5000) {
+		for (int i = 0; i < 16 && s_diagNPCs[i]; i++) {
+			if (s_diagCounts[i] > 100) {
+				_MESSAGE("[RBRN] STORM-DIAG NPC=%08X rate=%u/5s (%.0f/sec) fgp=%p",
+					s_diagNPCs[i], s_diagCounts[i],
+					(float)s_diagCounts[i] / 5.0f, FaceGenParams);
+			}
+		}
+		memset(s_diagNPCs, 0, sizeof(s_diagNPCs));
+		memset(s_diagCounts, 0, sizeof(s_diagCounts));
+		s_diagWindowStart = nowMs;
+	}
+	if (NPC) {
+		UInt32 fid = NPC->refID;
+		for (int i = 0; i < 16; i++) {
+			if (s_diagNPCs[i] == fid) { s_diagCounts[i]++; break; }
+			if (s_diagNPCs[i] == 0)   { s_diagNPCs[i] = fid; s_diagCounts[i] = 1; break; }
+		}
+	}
+	if (nowMs - lastTickMs > 50) {
+		lastNPC = nullptr;
+		lastFGP = nullptr;
+		dupeCount = 0;
+	}
+	lastTickMs = nowMs;
 
 	bool isDupe = (NPC == lastNPC && FaceGenParams == lastFGP);
 	if (isDupe) {
